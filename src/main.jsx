@@ -263,7 +263,7 @@ function findDrawingSheet(workbook) {
   });
 }
 
-function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
+function parseDrawingRegister(workbook) {
   const targetSheet = findDrawingSheet(workbook);
   if (!targetSheet) {
     throw new Error(`No MIDP/TIDP drawing register sheet was found. Available sheets: ${workbook.SheetNames.join(', ')}`);
@@ -314,9 +314,6 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
 
   rows.slice(headerRow + 1).forEach((row, offset) => {
     const doc = clean(row[docIndex]);
-    const subOwner = clean(row[ownerIndex]);
-
-    if (filterGLS && !clean(subOwner).toUpperCase().includes('GLS')) return;
     if (!doc) return;
 
     scopedRows += 1;
@@ -343,12 +340,10 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
   });
 
   if (!records.length) {
-    throw new Error(filterGLS
-      ? `${targetSheet} was read successfully, but no GLS rows were found. The TAJ MIDP is filtered ONLY by Column Z (Sub-Owner) = GLS. The GLS TIDP is NOT filtered by Column Z.`
-      : `${targetSheet} was read successfully, but no drawing rows were found.`);
+    throw new Error(targetSheet + ' was read successfully, but no drawing rows were found.');
   }
 
-  // If duplicate PDF/CAD records exist for the same drawing, prefer PDF.
+  ds exist for the same drawing, prefer PDF.
   const map = new Map();
   records.forEach((record) => {
     const existing = map.get(record.base);
@@ -359,14 +354,11 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
 }
 
 function parseTajMidp(workbook) {
-  // TAJ MIDP contains multiple disciplines/sub-owners.
-  // Only Column Z = GLS belongs in this comparison.
-  return parseDrawingRegister(workbook, { filterGLS: true });
+  return parseDrawingRegister(workbook);
 }
 
 function parseGlsTidp(workbook) {
-  // GLS TIDP contains only GLS drawings, so every drawing row is included.
-  return parseDrawingRegister(workbook, { filterGLS: false });
+  return parseDrawingRegister(workbook);
 }
 function compareMidpRecords(taj, gls) {
   const tajMap = new Map(taj.map((r) => [r.base, r]));
