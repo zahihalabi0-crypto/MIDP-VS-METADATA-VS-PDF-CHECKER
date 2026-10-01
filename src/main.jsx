@@ -326,12 +326,13 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
   const titleIndex = 6;       // G
   const revisionIndex = 13;   // N
   const ownerIndex = 25;      // Z
+  const statusIndexes = [10, 11, 12]; // K, L, M
 
   const rawHeaders = rows[headerRow].map((h, i) => clean(h) || `Column ${i + 1}`);
   const normalizedHeaders = rawHeaders.map((h) => clean(h).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim());
 
-  // Prefer the actual column headed "Status" for Code B / Code C / UR checks.
-  // Status is fixed to Column K (11th Excel column) in the drawing register.
+  // Status / suitability codes are checked across Columns K, L and M.
+  // K is the primary status column, while L/M may contain additional codes.
   const statusIndex = 10; // K
 
   const records = [];
@@ -358,6 +359,10 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
     });
 
     const rowAction = detectRowAction(worksheet, headerRow + 1 + offset, Math.max(rawHeaders.length, row.length));
+    const statusCodes = statusIndexes
+      .map((index) => clean(row[index]))
+      .filter(Boolean);
+    const combinedStatus = statusCodes.join(' | ');
 
     records.push({
       sourceRow: headerRow + offset + 2,
@@ -366,10 +371,11 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
       base: key,
       title: clean(row[titleIndex]),
       revision: revision(row[revisionIndex]),
-      status: clean(row[statusIndex]),
+      status: combinedStatus,
+      statusCodes,
       suitabilityStatus: clean(row[suitabilityIndex]),
       statusColumn: statusIndex + 1,
-      category: clean(row[statusIndex]),
+      category: midpCategory(row, statusIndexes[0], statusIndexes[1]),
       subOwner: clean(row[ownerIndex]),
       requestedAction: rowAction,
       values,
@@ -405,91 +411,119 @@ function compareMidpRecords(taj, gls) {
   const keys = [...new Set([...tajMap.keys(), ...glsMap.keys()])].sort();
 
   return keys.map((key) => {
-    const a = tajMap.get(key);
-    const b = glsMap.get(key);
+    const tajRecord = tajMap.get(key);
+    const glsRecord = glsMap.get(key);
+    const requestedAction = glsRecord?.requestedAction || 'NO CHANGE';
 
-    if (!a) {
-      const requested = b?.requestedAction || '';
+    // ADD: requested drawing must exist in the TAJ MIDP.
+    if (!tajRecord && glsRecord) {
       return {
-        key, type: 'added', taj: null, gls: b,
-        requestedAction: requested,
-        implementationStatus: requested === 'ADD' ? 'NOT IMPLEMENTED'
-          : requested === 'REMOVE' ? 'IMPLEMENTED'
-          : requested === 'MODIFY' ? 'NOT IMPLEMENTED'
-          : 'CHECK',
-        changes: ['Drawing exists in TIDP but not baseline MIDP'],
+        key,
+        type: 'added',
+        taj: null,
+        gls: glsRecord,
+        requestedAction,
+        implementationStatus: requestedAction === 'ADD' ? 'NO' : requestedAction === 'REMOVE' ? 'YES' : 'NO',
+        changes: [],
         fieldChanges: [],
-        revisionChanged: false, suitabilityChanged: false, titleChanged: false,
+        revisionChanged: false,
+        suitabilityChanged: false,
+        titleChanged: false,
+        statusChanged: false,
       };
     }
 
-    if (!b) {
+    // REMOVE: requested drawing must no longer exist in the TAJ MIDP.
+    if (tajRecord && !glsRecord) {
       return {
-        key, type: 'removed', taj: a, gls: null,
-        requestedAction: '',
-        implementationStatus: 'CHECK',
-        changes: ['Drawing exists in baseline MIDP but not updated TIDP'],
+        key,
+        type: 'removed',
+        taj: tajRecord,
+        gls: null,
+        requestedAction: 'NO CHANGE',
+        implementationStatus: 'N/A',
+        changes: [],
         fieldChanges: [],
-        revisionChanged: false, suitabilityChanged: false, titleChanged: false,
+        revisionChanged: false,
+        suitabilityChanged: false,
+        titleChanged: false,
+        statusChanged: false,
       };
     }
 
-    const headers = [...new Set([...(a.headers || []), ...(b.headers || [])])];
-    const fieldChanges = headers.map((field) => ({
-      field, taj: a.values?.[field] ?? '', gls: b.values?.[field] ?? '',
-    })).filter((x) => normalizeCompareValue(x.taj) !== normalizeCompareValue(x.gls));
+    if (!tajRecord || !glsRecord) return null;
 
-    const revisionChanged = normalizeCompareValue(a.revision) !== normalizeCompareValue(b.revision);
-    const suitabilityChanged = normalizeCompareValue(a.status) !== normalizeCompareValue(b.status);
-    const titleChanged = normalizeCompareValue(a.title) !== normalizeCompareValue(b.title);
+    const tajTitle = normalizedTitle(tajRecord.title);
+    const glsTitle = normalizedTitle(glsRecord.title);
+    const tajStatus = normalizeCompareValue(tajRecord.statusCodes?.join(' | ') || tajRecord.status);
+    const glsStatus = normalizeCompareValue(glsRecord.statusCodes?.join(' | ') || glsRecord.status);
 
-    const requestedAction = b.requestedAction || '';
-    let implementationStatus = 'NO REQUESTED COLOUR';
-    if (requestedAction === 'REMOVE') {
-      implementationStatus = 'NOT IMPLEMENTED';
-    } else if (requestedAction === 'ADD') {
-      implementationStatus = 'IMPLEMENTED';
+    const titleChanged = tajTitle !== glsTitle;
+    const statusChanged = tajStatus !== glsStatus;
+    const revisionChanged = normalizeCompareValue(tajRecord.revision) !== normalizeCompareValue(glsRecord.revision);
+
+    // MODIFY is implemented only when the TAJ MIDP matches the updated
+    // GLS TIDP title AND status/suitability codes.
+    let implementationStatus = 'N/A';
+    if (requestedAction === 'ADD') {
+      implementationStatus = 'YES';
+    } else if (requestedAction === 'REMOVE') {
+      implementationStatus = 'NO';
     } else if (requestedAction === 'MODIFY') {
-      implementationStatus = (revisionChanged || suitabilityChanged || titleChanged || fieldChanges.length)
-        ? 'IMPLEMENTED'
-        : 'NOT IMPLEMENTED';
-    } else if (revisionChanged || suitabilityChanged || titleChanged) {
-      implementationStatus = 'NOT MATCHING';
-    } else {
-      implementationStatus = 'MATCHING';
+      implementationStatus = !titleChanged && !statusChanged ? 'YES' : 'NO';
     }
+
+    const type = titleChanged || statusChanged || revisionChanged ? 'changed' : 'unchanged';
 
     return {
-      key, type: fieldChanges.length ? 'changed' : 'unchanged',
-      taj: a, gls: b, requestedAction, implementationStatus,
-      changes: fieldChanges.map((x) => x.field), fieldChanges,
-      revisionChanged, suitabilityChanged, titleChanged,
+      key,
+      type,
+      taj: tajRecord,
+      gls: glsRecord,
+      requestedAction,
+      implementationStatus,
+      changes: [],
+      fieldChanges: [
+        ...(titleChanged ? [{ field: 'DRAWING TITLE', taj: tajRecord.title, gls: glsRecord.title }] : []),
+        ...(statusChanged ? [{ field: 'STATUS / SUITABILITY CODES', taj: tajRecord.status, gls: glsRecord.status }] : []),
+        ...(revisionChanged ? [{ field: 'REVISION', taj: tajRecord.revision, gls: glsRecord.revision }] : []),
+      ],
+      revisionChanged,
+      suitabilityChanged: statusChanged,
+      titleChanged,
+      statusChanged,
     };
-  });
+  }).filter(Boolean);
 }
 
 function midpSummary(records) {
   const summary = {
     total: records.length,
-    UR: 0, 'Code B': 0, 'Code C': 0, 'Code D': 0, NYS: 0,
-    ADD: 0, REMOVE: 0, MODIFY: 0, Other: 0
+    UR: 0,
+    'Code B': 0,
+    'Code C': 0,
+    'Code D': 0,
+    NYS: 0,
   };
 
   records.forEach((r) => {
-    const status = normalizeCompareValue(r.status);
-    if (/^UR$|UNDER REVIEW/.test(status)) summary.UR += 1;
-    else if (/CODE\\s*B|^B$/.test(status)) summary['Code B'] += 1;
-    else if (/CODE\\s*C|^C$/.test(status)) summary['Code C'] += 1;
-    else if (/CODE\\s*D|^D$/.test(status)) summary['Code D'] += 1;
-    else if (/NYS|NOT YET SUBMITTED/.test(status)) summary.NYS += 1;
-    else summary.Other += 1;
-
-    if (r.requestedAction === 'ADD') summary.ADD += 1;
-    else if (r.requestedAction === 'REMOVE') summary.REMOVE += 1;
-    else if (r.requestedAction === 'MODIFY') summary.MODIFY += 1;
+    const status = normalizeCompareValue(r.statusCodes?.join(' | ') || r.status);
+    if (/\\bUR\\b|UNDER REVIEW/.test(status)) summary.UR += 1;
+    if (/\\bCODE\\s*B\\b|\\bB\\b/.test(status)) summary['Code B'] += 1;
+    if (/\\bCODE\\s*C\\b|\\bC\\b/.test(status)) summary['Code C'] += 1;
+    if (/\\bCODE\\s*D\\b|\\bD\\b/.test(status)) summary['Code D'] += 1;
+    if (/\\bNYS\\b|NOT YET SUBMITTED/.test(status)) summary.NYS += 1;
   });
 
   return summary;
+}
+
+function implementationSummary(rows) {
+  return {
+    totalRequests: rows.filter((r) => ['ADD', 'REMOVE', 'MODIFY'].includes(r.requestedAction)).length,
+    implemented: rows.filter((r) => r.implementationStatus === 'YES').length,
+    notImplemented: rows.filter((r) => r.implementationStatus === 'NO').length,
+  };
 }
 
 function MidpSummaryCard({ title, summary }) {
@@ -577,6 +611,7 @@ function App() {
         rows,
         tajSummary: midpSummary(taj.records),
         glsSummary: midpSummary(gls.records),
+        implementation: implementationSummary(rows),
         counts: {
           added: rows.filter((r) => r.type === 'added').length,
           removed: rows.filter((r) => r.type === 'removed').length,
@@ -709,14 +744,33 @@ function App() {
             <p className="helper"><Info size={13}/> The comparison is processed locally in your browser.</p>
           </section> : <section className="results midp-results">
             <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS TIDP</h2><p>Weekly implementation audit: TIDP colour marks requested ADD / REMOVE / MODIFY actions; the current TAJ MIDP is checked to confirm whether those requests were implemented.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
-            <div className="gls-filter-note"><strong>Result:</strong> Drawing numbers are matched between GLS TIDP and TAJ MIDP. GLS colour = expected action; TAJ = actual implementation.</div>
-            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>TAJ Drawing Title</span><span>TIDP Drawing Title</span><span>TAJ Status</span><span>TIDP Status</span><span>Requested</span><span>Implementation</span></div>
+            <div className="gls-filter-note"><strong>Audit logic:</strong> GLS TIDP colour = requested action. TAJ MIDP = implementation check. MODIFY is verified by drawing title + K/L/M status codes.</div>
+
+            <div className="midp-summary-columns">
+              <MidpSummaryCard title="GLS TIDP" summary={midpComparison.glsSummary} />
+              <MidpSummaryCard title="TAJ MIDP — GLS drawings" summary={midpComparison.tajSummary} />
+            </div>
+
+            <div className="midp-change-grid">
+              <div><small>Total Requests</small><strong>{midpComparison.implementation.totalRequests}</strong></div>
+              <div><small>Implemented</small><strong>{midpComparison.implementation.implemented}</strong></div>
+              <div><small>Not Implemented</small><strong>{midpComparison.implementation.notImplemented}</strong></div>
+              <div><small>TIDP / MIDP Drawings</small><strong>{midpComparison.glsSummary.total} / {midpComparison.tajSummary.total}</strong></div>
+            </div>
+
+            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>GLS Expected Action</span><span>TAJ Drawing Title</span><span>TIDP Drawing Title</span><span>TAJ Status</span><span>TIDP Status</span><span>TAJ Implemented?</span></div>
             <div className="checks">{midpComparison.rows.map((r) => <article className="check" key={r.key}>
-              <div className="midp-result-row"><strong>{r.key}</strong><span title={r.taj?.title || ''}>{r.taj?.title || '—'}</span><span title={r.gls?.title || ''}>{r.gls?.title || '—'}</span><span>{r.taj?.status || '—'}</span><span>{r.gls?.status || '—'}</span><span>{r.requestedAction || '—'}</span><span title={r.implementationStatus}>{r.implementationStatus}</span></div>
-              {r.type === 'changed' && <div className="midp-field-changes">
-                {r.fieldChanges.map((c) => <div className="midp-field-change" key={c.field}><strong>{c.field}</strong><span title={c.taj || ''}>{c.taj || '—'}</span><span title={c.gls || ''}>{c.gls || '—'}</span></div>)}
-              </div>}
+              <div className="midp-result-row">
+                <strong>{r.key}</strong>
+                <span>{r.requestedAction}</span>
+                <span title={r.taj?.title || ''}>{r.taj?.title || '—'}</span>
+                <span title={r.gls?.title || ''}>{r.gls?.title || '—'}</span>
+                <span>{r.taj?.status || '—'}</span>
+                <span>{r.gls?.status || '—'}</span>
+                <span className={r.implementationStatus === 'YES' ? 'implementation-yes' : r.implementationStatus === 'NO' ? 'implementation-no' : ''}>{r.implementationStatus}</span>
+              </div>
             </article>)}</div>
+
             <div className="next-check"><div><span className="eyebrow">NEXT STEP</span><h3>MIDP vs Metadata vs PDF</h3><p>Continue with the existing drawing validation workflow using the GLS TIDP.</p></div><button className="primary" onClick={() => { setMidpFiles(glsMidpFiles); setMode('validator'); }}><ArrowRight size={18}/>Continue to drawing checker</button></div>
           </section>}
         </main>
