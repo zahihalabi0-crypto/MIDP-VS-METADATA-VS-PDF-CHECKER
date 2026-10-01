@@ -274,11 +274,16 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
   const ownerIndex = 25; // Column Z
   let headerRow = -1;
 
-  // Always identify the register header from DRAWING NUMBER.
-  // Column Z is used only as a filter for the TAJ MIDP.
-  // The GLS TIDP is already GLS-only and is never filtered by Column Z.
-  for (let r = 0; r < Math.min(rows.length, 100); r += 1) {
-    if (rows[r].some(isDrawingHeader)) { headerRow = r; break; }
+  // Find the actual register header. For TAJ MIDP, require both
+  // DRAWING NUMBER and the Column Z "Sub Owner" header on the same row.
+  // The GLS TIDP only needs DRAWING NUMBER.
+  for (let r = 0; r < Math.min(rows.length, 150); r += 1) {
+    const hasDrawingHeader = rows[r].some(isDrawingHeader);
+    const hasOwnerHeader = clean(rows[r][ownerIndex]).toLowerCase().includes('sub owner');
+    if (hasDrawingHeader && (!filterGLS || hasOwnerHeader)) {
+      headerRow = r;
+      break;
+    }
   }
   if (headerRow < 0) {
     throw new Error(`${targetSheet} was found, but the drawing register header row could not be identified.`);
@@ -303,7 +308,7 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
     const doc = clean(row[docIndex]);
     const subOwner = clean(row[ownerIndex]);
 
-    if (filterGLS && clean(subOwner).toUpperCase() !== 'GLS') return;
+    if (filterGLS && clean(subOwner).replace(/\\s+/g, ' ').trim().toUpperCase() !== 'GLS') return;
     if (!doc) return;
 
     scopedRows += 1;
