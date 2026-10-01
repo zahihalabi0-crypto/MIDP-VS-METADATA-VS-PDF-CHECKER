@@ -455,8 +455,8 @@ function compareMidpRecords(taj, gls) {
 
     const tajTitle = normalizedTitle(tajRecord.title);
     const glsTitle = normalizedTitle(glsRecord.title);
-    const tajStatus = normalizeCompareValue(tajRecord.statusCodes?.join(' | ') || tajRecord.status);
-    const glsStatus = normalizeCompareValue(glsRecord.statusCodes?.join(' | ') || glsRecord.status);
+    const tajStatus = normalizeCompareValue(statusFromColumnK(tajRecord));
+    const glsStatus = normalizeCompareValue(statusFromColumnK(glsRecord));
 
     const titleChanged = tajTitle !== glsTitle;
     const statusChanged = tajStatus !== glsStatus;
@@ -496,6 +496,21 @@ function compareMidpRecords(taj, gls) {
   }).filter(Boolean);
 }
 
+function statusFromColumnK(record) {
+  // Column K is the authoritative drawing status.
+  return clean(record?.statusCodes?.[0] || record?.status || '');
+}
+
+function classifyStatus(value) {
+  const status = normalizeCompareValue(value);
+  if (/\\bUR\\b|UNDER REVIEW/.test(status)) return 'UR';
+  if (/\\bCODE\\s*B\\b|^B$/.test(status)) return 'Code B';
+  if (/\\bCODE\\s*C\\b|^C$/.test(status)) return 'Code C';
+  if (/\\bCODE\\s*D\\b|^D$/.test(status)) return 'Code D';
+  if (/\\bNYS\\b|NOT YET SUBMITTED/.test(status)) return 'NYS';
+  return 'Other';
+}
+
 function midpSummary(records) {
   const summary = {
     total: records.length,
@@ -504,15 +519,12 @@ function midpSummary(records) {
     'Code C': 0,
     'Code D': 0,
     NYS: 0,
+    Other: 0,
   };
 
   records.forEach((r) => {
-    const status = normalizeCompareValue(r.statusCodes?.join(' | ') || r.status);
-    if (/\\bUR\\b|UNDER REVIEW/.test(status)) summary.UR += 1;
-    if (/\\bCODE\\s*B\\b|\\bB\\b/.test(status)) summary['Code B'] += 1;
-    if (/\\bCODE\\s*C\\b|\\bC\\b/.test(status)) summary['Code C'] += 1;
-    if (/\\bCODE\\s*D\\b|\\bD\\b/.test(status)) summary['Code D'] += 1;
-    if (/\\bNYS\\b|NOT YET SUBMITTED/.test(status)) summary.NYS += 1;
+    const category = classifyStatus(statusFromColumnK(r));
+    summary[category] = (summary[category] || 0) + 1;
   });
 
   return summary;
@@ -523,6 +535,20 @@ function implementationSummary(rows) {
     totalRequests: rows.filter((r) => ['ADD', 'REMOVE', 'MODIFY'].includes(r.requestedAction)).length,
     implemented: rows.filter((r) => r.implementationStatus === 'YES').length,
     notImplemented: rows.filter((r) => r.implementationStatus === 'NO').length,
+  };
+}
+
+function buildStatusComparison(tajRecords, glsRecords) {
+  const taj = midpSummary(tajRecords);
+  const gls = midpSummary(glsRecords);
+  return {
+    labels: ['Total Drawings', 'Code B', 'Code C', 'UR'],
+    rows: [
+      ['Total Drawings', gls.total, taj.total],
+      ['Code B', gls['Code B'], taj['Code B']],
+      ['Code C', gls['Code C'], taj['Code C']],
+      ['UR', gls.UR, taj.UR],
+    ]
   };
 }
 
@@ -612,6 +638,7 @@ function App() {
         tajSummary: midpSummary(taj.records),
         glsSummary: midpSummary(gls.records),
         implementation: implementationSummary(rows),
+        statusComparison: buildStatusComparison(taj.records, gls.records),
         counts: {
           added: rows.filter((r) => r.type === 'added').length,
           removed: rows.filter((r) => r.type === 'removed').length,
@@ -639,8 +666,8 @@ function App() {
       'TIDP DRAWING TITLE': r.gls?.title || '',
       'MIDP Revision': r.taj?.revision || '',
       'TIDP Revision': r.gls?.revision || '',
-      'MIDP Status': r.taj?.status || '',
-      'TIDP Status': r.gls?.status || '',
+      'TAJ Status (Column K)': statusFromColumnK(r.taj),
+      'TIDP Status (Column K)': statusFromColumnK(r.gls),
       'Revision Changed': r.revisionChanged ? 'YES' : 'NO',
       'Status Changed': r.suitabilityChanged ? 'YES' : 'NO',
       'Title Changed': r.titleChanged ? 'YES' : 'NO',
@@ -656,7 +683,7 @@ function App() {
       'Implementation Status': r.implementationStatus,
       'DRAWING TITLE': r.gls?.title || r.taj?.title || '',
       'Revision': r.gls?.revision || r.taj?.revision || '',
-      'Status': r.gls?.status || r.taj?.status || '',
+      'Status (Column K)': statusFromColumnK(r.gls || r.taj),
     }));
 
     const revisionMismatches = midpComparison.rows
@@ -667,8 +694,8 @@ function App() {
         'Implementation Status': r.implementationStatus,
         'MIDP Revision': r.taj?.revision || '',
         'TIDP Revision': r.gls?.revision || '',
-        'MIDP Status': r.taj?.status || '',
-        'TIDP Status': r.gls?.status || '',
+        'TAJ Status (Column K)': statusFromColumnK(r.taj),
+        'TIDP Status (Column K)': statusFromColumnK(r.gls),
         'Revision Changed': r.revisionChanged ? 'YES' : 'NO',
         'Status Changed': r.suitabilityChanged ? 'YES' : 'NO',
         'Title Changed': r.titleChanged ? 'YES' : 'NO',
@@ -682,7 +709,7 @@ function App() {
       'Implementation Status': r.implementationStatus,
       'DRAWING TITLE': r.taj?.title || r.gls?.title || '',
       'Revision': r.taj?.revision || r.gls?.revision || '',
-      'Status': r.taj?.status || r.gls?.status || '',
+      'Status (Column K)': statusFromColumnK(r.taj || r.gls),
     }));
 
     const duplicates = [
@@ -751,6 +778,13 @@ function App() {
               <MidpSummaryCard title="TAJ MIDP — GLS drawings" summary={midpComparison.tajSummary} />
             </div>
 
+            <div className="status-audit-table">
+              <div className="status-audit-head"><span>Status / Metric</span><span>GLS TIDP</span><span>TAJ MIDP</span></div>
+              {midpComparison.statusComparison.rows.map(([label, glsValue, tajValue]) => (
+                <div className="status-audit-row" key={label}><strong>{label}</strong><span>{glsValue}</span><span>{tajValue}</span></div>
+              ))}
+            </div>
+
             <div className="midp-change-grid">
               <div><small>Total Requests</small><strong>{midpComparison.implementation.totalRequests}</strong></div>
               <div><small>Implemented</small><strong>{midpComparison.implementation.implemented}</strong></div>
@@ -765,8 +799,8 @@ function App() {
                 <span>{r.requestedAction}</span>
                 <span title={r.taj?.title || ''}>{r.taj?.title || '—'}</span>
                 <span title={r.gls?.title || ''}>{r.gls?.title || '—'}</span>
-                <span>{r.taj?.status || '—'}</span>
-                <span>{r.gls?.status || '—'}</span>
+                <span title="Column K — Status">{statusFromColumnK(r.taj) || '—'}</span>
+                <span title="Column K — Status">{statusFromColumnK(r.gls) || '—'}</span>
                 <span className={r.implementationStatus === 'YES' ? 'implementation-yes' : r.implementationStatus === 'NO' ? 'implementation-no' : ''}>{r.implementationStatus}</span>
               </div>
             </article>)}</div>
