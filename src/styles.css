@@ -64,3 +64,7 @@ footer { min-height:52px; border-top:1px solid #d8d2c7; padding:0 max(5vw,28px);
 .midp-field-change strong{font-size:11px;color:#354744;overflow-wrap:anywhere}
 .midp-field-change span{font-size:11px;color:#596966;overflow-wrap:anywhere;white-space:pre-wrap}
 .midp-results .check{margin-bottom:8px}
+
+.gls-filter-note{margin:0 0 18px;padding:12px 15px;border:1px solid #dcd8cf;border-radius:9px;background:#faf9f5;color:#596966;font-size:11px}
+.gls-filter-note strong{color:#2c4643}
+.gls-filter-note span{margin:0 8px;color:#a29d92}
