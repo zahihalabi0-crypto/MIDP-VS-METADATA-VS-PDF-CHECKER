@@ -250,6 +250,11 @@ function normalizeCompareValue(value) {
   return clean(value).replace(/\\s+/g, ' ').trim().toUpperCase();
 }
 
+function isGlsDrawingRow(values, doc) {
+  const text = Object.values(values || {}).join(' ');
+  return /\\bGLS\\b|GLASSLINE/i.test(text) || /-GLS-/i.test(doc);
+}
+
 function parseMidpForComparison(workbook) {
   const records = [];
   const statusAliases = ['status', 'status code', 'submission status', 'document status', 'status/code'];
@@ -286,12 +291,18 @@ function parseMidpForComparison(workbook) {
         values[header] = clean(row[i]);
       });
 
+      // Only keep drawings belonging to the GLS / Glassline subcontractor.
+      // The filter checks the complete row so it works whether GLS is stored
+      // under Originator, Subcontractor, Contractor, Company, Reference, etc.
+      if (!isGlsDrawingRow(values, doc)) return;
+
+      const titleIndex = headerIndex(rawHeaders, ['title', 'drawing title', 'document title', 'description']);
       records.push({
         sourceRow: headerRow + offset + 2,
         sheet: name,
         doc,
         base: baseNumber(doc),
-        title: clean(values[rawHeaders.find((h, i) => i === headerIndex(rawHeaders, ['title', 'drawing title', 'document title', 'description']))] || ''),
+        title: titleIndex >= 0 ? clean(row[titleIndex]) : '',
         revision: indexes.rev >= 0 ? revision(row[indexes.rev]) : '',
         status: indexes.status >= 0 ? clean(row[indexes.status]) : '',
         code: indexes.code >= 0 ? clean(row[indexes.code]) : '',
@@ -419,7 +430,8 @@ function App() {
       if (!taj.length || !gls.length) throw new Error('No drawing records were found in one or both MIDP files. Please check that the workbook contains a drawing number column.');
       const rows = compareMidpRecords(taj, gls);
       setMidpComparison({ taj, gls, rows, tajSummary: midpSummary(taj), glsSummary: midpSummary(gls),
-        counts: { added: rows.filter((r) => r.type === 'added').length, removed: rows.filter((r) => r.type === 'removed').length, changed: rows.filter((r) => r.type === 'changed').length, unchanged: rows.filter((r) => r.type === 'unchanged').length }
+        counts: { added: rows.filter((r) => r.type === 'added').length, removed: rows.filter((r) => r.type === 'removed').length, changed: rows.filter((r) => r.type === 'changed').length, unchanged: rows.filter((r) => r.type === 'unchanged').length },
+        filterLabel: 'GLS / Glassline drawings only'
       });
     } catch (e) { setMidpError(e.message || 'The MIDP files could not be compared.'); }
     finally { setMidpLoading(false); }
@@ -498,7 +510,7 @@ function App() {
         <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>BIM document validation</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
         <main>
           {!midpComparison ? <section className="workspace">
-            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS MIDP</h2><p>Compare the two MIDP files before checking MIDP, metadata and PDF consistency.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
+            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS MIDP</h2><p>Compare only the GLS / Glassline subcontractor drawings. Each drawing row is matched by Drawing Number and every available information field is compared.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
             <div className="drop-grid midp-upload-grid">
               <DropZone title="TAJ MIDP" subtitle="TAJ Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={tajMidpFiles} onFiles={(f) => setTajMidpFiles(f.slice(0,1))} color="#c77645" />
               <DropZone title="GLS MIDP" subtitle="Glassline Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
@@ -508,6 +520,7 @@ function App() {
             <p className="helper"><Info size={13}/> The comparison is processed locally in your browser.</p>
           </section> : <section className="results midp-results">
             <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS MIDP</h2><p>Drawing register differences and status/code totals.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
+            <div className="gls-filter-note"><strong>Filter:</strong> {midpComparison.filterLabel} <span>•</span> Drawing rows are matched by Drawing Number; every populated column is checked for changes.</div>
             <div className="midp-summary-columns"><MidpSummaryCard title="TAJ MIDP" summary={midpComparison.tajSummary} /><MidpSummaryCard title="GLS MIDP" summary={midpComparison.glsSummary} /></div>
             <div className="midp-change-grid"><div><small>Added in GLS</small><strong>{midpComparison.counts.added}</strong></div><div><small>Removed from GLS</small><strong>{midpComparison.counts.removed}</strong></div><div><small>Changed</small><strong>{midpComparison.counts.changed}</strong></div><div><small>Unchanged</small><strong>{midpComparison.counts.unchanged}</strong></div></div>
             <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>TAJ Status</span><span>GLS Status</span><span>Fields Changed</span><span>Result</span></div>
