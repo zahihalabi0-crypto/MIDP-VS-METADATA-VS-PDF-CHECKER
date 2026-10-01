@@ -105,6 +105,104 @@ function parseMetadata(workbook) {
   return records;
 }
 
+function normalizeMetadataDescription(value) {
+  return clean(value).toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
+}
+
+function parseMetadataComparison(workbook) {
+  const records = [];
+  for (const name of workbook.SheetNames) {
+    const rows = sheetRows(workbook, name);
+    const h = findHeader(rows, ['document no', 'document number']);
+    if (h < 0) continue;
+    const headers = rows[h];
+    const idx = {
+      doc: headerIndex(headers, ['document no', 'document number']),
+      description: headerIndex(headers, ['drawing description', 'description', 'drawing title', 'title']),
+      status: headerIndex(headers, ['status']),
+    };
+    if (idx.doc < 0) continue;
+    rows.slice(h + 1).forEach((row, offset) => {
+      const doc = clean(row[idx.doc]);
+      if (!DOC_PATTERN.test(doc)) return;
+      records.push({
+        sourceRow: h + offset + 2,
+        sheet: name,
+        doc,
+        base: baseNumber(doc),
+        description: idx.description >= 0 ? clean(row[idx.description]) : '',
+        status: idx.status >= 0 ? clean(row[idx.status]) : '',
+      });
+    });
+  }
+
+  const map = new Map();
+  const duplicates = [];
+  records.forEach((record) => {
+    if (map.has(record.base)) {
+      duplicates.push(record.base);
+      return;
+    }
+    map.set(record.base, record);
+  });
+
+  if (!map.size) {
+    throw new Error('No metadata drawing records were found. Check that both files contain a Document Number column.');
+  }
+  return { records: [...map.values()], duplicates };
+}
+
+function compareMetadataVersions(gls, taj) {
+  const glsMap = new Map(gls.records.map((r) => [r.base, r]));
+  const tajMap = new Map(taj.records.map((r) => [r.base, r]));
+
+  const rows = [...glsMap.keys()].sort().map((key) => {
+    const glsRecord = glsMap.get(key);
+    const tajRecord = tajMap.get(key);
+    const existsInTaj = Boolean(tajRecord);
+    const descriptionMatch = existsInTaj
+      && normalizeMetadataDescription(glsRecord.description) === normalizeMetadataDescription(tajRecord.description);
+    const statusMatch = existsInTaj
+      && normalizeCompareValue(glsRecord.status) === normalizeCompareValue(tajRecord.status);
+
+    return {
+      key,
+      gls: glsRecord,
+      taj: tajRecord || null,
+      existsInTaj,
+      descriptionMatch,
+      statusMatch,
+      overallMatch: existsInTaj && descriptionMatch && statusMatch,
+      result: !existsInTaj ? 'NOT IN TAJ' : (descriptionMatch && statusMatch ? 'MATCHING' : 'NOT MATCHING'),
+    };
+  });
+
+  const statusTotals = {};
+  [...gls.records, ...taj.records].forEach((record) => {
+    const status = clean(record.status) || 'Blank';
+    if (!statusTotals[status]) statusTotals[status] = { gls: 0, taj: 0 };
+    if (glsMap.has(record.base)) statusTotals[status].gls += 1;
+    if (tajMap.has(record.base)) statusTotals[status].taj += 1;
+  });
+
+  return {
+    rows,
+    summary: {
+      glsTotal: gls.records.length,
+      tajTotal: taj.records.length,
+      inTaj: rows.filter((r) => r.existsInTaj).length,
+      notInTaj: rows.filter((r) => !r.existsInTaj).length,
+      descriptionMatching: rows.filter((r) => r.existsInTaj && r.descriptionMatch).length,
+      descriptionNotMatching: rows.filter((r) => r.existsInTaj && !r.descriptionMatch).length,
+      statusMatching: rows.filter((r) => r.existsInTaj && r.statusMatch).length,
+      statusNotMatching: rows.filter((r) => r.existsInTaj && !r.statusMatch).length,
+      overallMatching: rows.filter((r) => r.overallMatch).length,
+      overallNotMatching: rows.filter((r) => !r.overallMatch).length,
+    },
+    statusTotals: Object.entries(statusTotals).sort(([a],[b]) => a.localeCompare(b)),
+  };
+}
+
 function parseMidp(workbook) {
   const records = [];
   // Limit this release to drawing registers. Some non-drawing tabs in real MIDPs
@@ -624,107 +722,60 @@ function App() {
   async function runMidpComparison() {
     setMidpLoading(true); setMidpError(''); setMidpComparison(null);
     try {
-      const [tajBook, glsBook] = await Promise.all([readWorkbook(tajMidpFiles[0]), readWorkbook(glsMidpFiles[0])]);
-      const taj = parseTajMidp(tajBook);
-      const gls = parseGlsTidp(glsBook);
-      const rows = compareMidpRecords(taj, gls);
-
-      setMidpComparison({
-        taj: taj.records,
-        gls: gls.records,
-        tajDuplicates: taj.duplicates,
-        glsDuplicates: gls.duplicates,
-        rows,
-        tajSummary: midpSummary(taj.records),
-        glsSummary: midpSummary(gls.records),
-        implementation: implementationSummary(rows),
-        statusComparison: buildStatusComparison(taj.records, gls.records),
-        counts: {
-          added: rows.filter((r) => r.type === 'added').length,
-          removed: rows.filter((r) => r.type === 'removed').length,
-          changed: rows.filter((r) => r.type === 'changed').length,
-          unchanged: rows.filter((r) => r.type === 'unchanged').length,
-        },
-        filterLabel: 'Baseline MIDP: Column Z (Sub-Owner) = GLS; Updated TIDP: no Sub-Owner filter; TIDP colours = red Remove, green Add, yellow Modify'
-      });
+      const [glsBook, tajBook] = await Promise.all([
+        readWorkbook(glsMidpFiles[0]),
+        readWorkbook(tajMidpFiles[0]),
+      ]);
+      const gls = parseMetadataComparison(glsBook);
+      const taj = parseMetadataComparison(tajBook);
+      const comparison = compareMetadataVersions(gls, taj);
+      setMidpComparison({ ...comparison, glsDuplicates: gls.duplicates, tajDuplicates: taj.duplicates });
     } catch (e) {
-      setMidpError(e.message || 'The MIDP/TIDP files could not be compared.');
+      setMidpError(e.message || 'The GLS and TAJ metadata files could not be compared.');
+    } finally {
+      setMidpLoading(false);
     }
-    finally { setMidpLoading(false); }
   }
 
   function downloadMidpReport() {
     if (!midpComparison) return;
-
     const makeSheet = (rows) => XLSX.utils.json_to_sheet(rows.length ? rows : [{ 'DRAWING NUMBER': 'No records' }]);
 
-    const fullSummary = midpComparison.rows.map((r) => ({
+    const details = midpComparison.rows.map((r) => ({
       'DRAWING NUMBER': r.key,
-      'Requested Action (TIDP Colour)': r.requestedAction || '—',
-      'Implementation Status': r.implementationStatus,
-      'MIDP DRAWING TITLE': r.taj?.title || '',
-      'TIDP DRAWING TITLE': r.gls?.title || '',
-      'MIDP Revision': r.taj?.revision || '',
-      'TIDP Revision': r.gls?.revision || '',
-      'TAJ Status (Column K)': statusFromColumnK(r.taj),
-      'TIDP Status (Column K)': statusFromColumnK(r.gls),
-      'Revision Changed': r.revisionChanged ? 'YES' : 'NO',
-      'Status Changed': r.suitabilityChanged ? 'YES' : 'NO',
-      'Title Changed': r.titleChanged ? 'YES' : 'NO',
-      'Comparison Status': r.type === 'added' ? 'ADDED'
-        : r.type === 'removed' ? 'REMOVED'
-        : r.revisionChanged || r.suitabilityChanged ? 'REVISION / STATUS CHANGED'
-        : r.titleChanged ? 'TITLE CHANGED' : 'UNCHANGED',
+      'GLS DESCRIPTION': r.gls?.description || '',
+      'TAJ DESCRIPTION': r.taj?.description || '',
+      'IN TAJ': r.existsInTaj ? 'YES' : 'NO',
+      'DESCRIPTION MATCH': r.existsInTaj ? (r.descriptionMatch ? 'YES' : 'NO') : '—',
+      'GLS STATUS': r.gls?.status || '',
+      'TAJ STATUS': r.taj?.status || '',
+      'STATUS MATCH': r.existsInTaj ? (r.statusMatch ? 'YES' : 'NO') : '—',
+      'OVERALL': r.result,
     }));
 
-    const added = midpComparison.rows.filter((r) => r.type === 'added' || r.requestedAction === 'ADD').map((r) => ({
+    const addedToGls = midpComparison.rows.map((r) => ({
       'DRAWING NUMBER': r.key,
-      'Requested Action': r.requestedAction || 'ADD',
-      'Implementation Status': r.implementationStatus,
-      'DRAWING TITLE': r.gls?.title || r.taj?.title || '',
-      'Revision': r.gls?.revision || r.taj?.revision || '',
-      'Status (Column K)': statusFromColumnK(r.gls || r.taj),
+      'GLS DESCRIPTION': r.gls?.description || '',
+      'TAJ DESCRIPTION': r.taj?.description || '',
+      'ALREADY IN TAJ': r.existsInTaj ? 'YES' : 'NO',
+      'DESCRIPTION MATCH': r.existsInTaj ? (r.descriptionMatch ? 'YES' : 'NO') : '—',
+      'GLS STATUS': r.gls?.status || '',
+      'TAJ STATUS': r.taj?.status || '',
+      'STATUS MATCH': r.existsInTaj ? (r.statusMatch ? 'YES' : 'NO') : '—',
+      'RESULT': r.result,
     }));
 
-    const revisionMismatches = midpComparison.rows
-      .filter((r) => r.revisionChanged || r.suitabilityChanged || r.titleChanged)
-      .map((r) => ({
-        'DRAWING NUMBER': r.key,
-        'Requested Action': r.requestedAction || '',
-        'Implementation Status': r.implementationStatus,
-        'MIDP Revision': r.taj?.revision || '',
-        'TIDP Revision': r.gls?.revision || '',
-        'TAJ Status (Column K)': statusFromColumnK(r.taj),
-        'TIDP Status (Column K)': statusFromColumnK(r.gls),
-        'Revision Changed': r.revisionChanged ? 'YES' : 'NO',
-        'Status Changed': r.suitabilityChanged ? 'YES' : 'NO',
-        'Title Changed': r.titleChanged ? 'YES' : 'NO',
-        'MIDP Title': r.taj?.title || '',
-        'TIDP Title': r.gls?.title || '',
-      }));
-
-    const missing = midpComparison.rows.filter((r) => r.type === 'removed' || r.requestedAction === 'REMOVE').map((r) => ({
-      'DRAWING NUMBER': r.key,
-      'Requested Action': r.requestedAction || 'REMOVE',
-      'Implementation Status': r.implementationStatus,
-      'DRAWING TITLE': r.taj?.title || r.gls?.title || '',
-      'Revision': r.taj?.revision || r.gls?.revision || '',
-      'Status (Column K)': statusFromColumnK(r.taj || r.gls),
+    const statusTotals = midpComparison.statusTotals.map(([status, values]) => ({
+      STATUS: status,
+      'GLS TOTAL': values.gls,
+      'TAJ TOTAL': values.taj,
     }));
-
-    const duplicates = [
-      ...midpComparison.tajDuplicates.map((d) => ({ Source: 'Baseline MIDP', 'DRAWING NUMBER': d })),
-      ...midpComparison.glsDuplicates.map((d) => ({ Source: 'Updated TIDP', 'DRAWING NUMBER': d })),
-    ];
 
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, makeSheet(fullSummary), 'Full Summary');
-    XLSX.utils.book_append_sheet(wb, makeSheet(added), 'Added Drawings');
-    XLSX.utils.book_append_sheet(wb, makeSheet(revisionMismatches), 'Revision Mismatches');
-    XLSX.utils.book_append_sheet(wb, makeSheet(missing), 'Missing Drawings');
-    if (duplicates.length) XLSX.utils.book_append_sheet(wb, makeSheet(duplicates), 'Duplicate Drawings');
-
-    XLSX.writeFile(wb, `MIDP_vs_TIDP_Comparison_Report_${new Date().toISOString().slice(0,10)}.xlsx`);
+    XLSX.utils.book_append_sheet(wb, makeSheet(details), 'GLS vs TAJ');
+    XLSX.utils.book_append_sheet(wb, makeSheet(addedToGls), 'GLS Drawings');
+    XLSX.utils.book_append_sheet(wb, makeSheet(statusTotals), 'Status Totals');
+    XLSX.writeFile(wb, `GLS_Metadata_vs_TAJ_Metadata_${new Date().toISOString().slice(0,10)}.xlsx`);
   }
 
   async function runCheck() {
@@ -758,65 +809,61 @@ function App() {
   if (mode === 'midp') {
     return (
       <div className="app">
-        <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>BIM document validation</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
+        <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>Metadata comparison</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
         <main>
           {!midpComparison ? <section className="workspace">
-            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS TIDP</h2><p>Compare drawing deliverables from MIDP-DRW-SWD. Baseline MIDP = Sub-Owner GLS; updated TIDP = no Sub-Owner filter. TIDP colour marks are used as the weekly requested-change instruction.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
+            <div className="section-title"><div><span>01</span><div><h2>GLS Metadata vs TAJ Metadata</h2><p>Compare GLS drawing descriptions and status against the TAJ metadata.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
             <div className="drop-grid midp-upload-grid">
-              <DropZone title="TAJ MIDP" subtitle="TAJ Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={tajMidpFiles} onFiles={(f) => setTajMidpFiles(f.slice(0,1))} color="#c77645" />
-              <DropZone title="GLS TIDP" subtitle="Glassline Task Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
+              <DropZone title="GLS Metadata" subtitle="Glassline metadata export" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
+              <DropZone title="TAJ Metadata" subtitle="TAJ metadata export" icon={FileSpreadsheet} accept=".xlsx,.xls" files={tajMidpFiles} onFiles={(f) => setTajMidpFiles(f.slice(0,1))} color="#c77645" />
             </div>
             {midpError && <div className="error"><XCircle size={18}/>{midpError}</div>}
-            <button className="primary" disabled={!tajMidpFiles.length || !glsMidpFiles.length || midpLoading} onClick={runMidpComparison}>{midpLoading ? <><LoaderCircle className="spin"/>Comparing MIDPs…</> : <>Compare TAJ vs GLS <ArrowRight size={18}/></>}</button>
+            <button className="primary" disabled={!glsMidpFiles.length || !tajMidpFiles.length || midpLoading} onClick={runMidpComparison}>{midpLoading ? <><LoaderCircle className="spin"/>Comparing metadata…</> : <>Compare GLS vs TAJ <ArrowRight size={18}/></>}</button>
             <p className="helper"><Info size={13}/> The comparison is processed locally in your browser.</p>
           </section> : <section className="results midp-results">
-            <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS TIDP</h2><p>Weekly implementation audit: TIDP colour marks requested ADD / REMOVE / MODIFY actions; the current TAJ MIDP is checked to confirm whether those requests were implemented.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
-            <div className="gls-filter-note"><strong>Audit logic:</strong> GLS TIDP colour = requested action. TAJ MIDP = implementation check. MODIFY is verified by drawing title + K/L/M status codes.</div>
-
-            <div className="midp-summary-columns">
-              <MidpSummaryCard title="GLS TIDP" summary={midpComparison.glsSummary} />
-              <MidpSummaryCard title="TAJ MIDP — GLS drawings" summary={midpComparison.tajSummary} />
-            </div>
-
-            <div className="status-audit-table">
-              <div className="status-audit-head"><span>Status / Metric</span><span>GLS TIDP</span><span>TAJ MIDP</span></div>
-              {midpComparison.statusComparison.rows.map(([label, glsValue, tajValue]) => (
-                <div className="status-audit-row" key={label}><strong>{label}</strong><span>{glsValue}</span><span>{tajValue}</span></div>
-              ))}
-            </div>
+            <div className="results-top"><div><span className="eyebrow">METADATA COMPARISON COMPLETE</span><h2>GLS Metadata vs TAJ Metadata</h2><p>Each GLS drawing is checked to see whether it exists in TAJ, whether the drawing description matches, and whether the status matches.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
 
             <div className="midp-change-grid">
-              <div><small>Total Requests</small><strong>{midpComparison.implementation.totalRequests}</strong></div>
-              <div><small>Implemented</small><strong>{midpComparison.implementation.implemented}</strong></div>
-              <div><small>Not Implemented</small><strong>{midpComparison.implementation.notImplemented}</strong></div>
-              <div><small>TIDP / MIDP Drawings</small><strong>{midpComparison.glsSummary.total} / {midpComparison.tajSummary.total}</strong></div>
+              <div><small>GLS Total</small><strong>{midpComparison.summary.glsTotal}</strong></div>
+              <div><small>TAJ Total</small><strong>{midpComparison.summary.tajTotal}</strong></div>
+              <div><small>Already in TAJ</small><strong>{midpComparison.summary.inTaj}</strong></div>
+              <div><small>Added to GLS / Not in TAJ</small><strong>{midpComparison.summary.notInTaj}</strong></div>
             </div>
 
             <div className="simple-match-summary">
               <div className="simple-match-card matching">
                 <div className="simple-match-title">Matching</div>
-                <strong>{midpComparison.rows.filter((r) => r.implementationStatus === 'YES').length}</strong>
+                <strong>{midpComparison.summary.overallMatching}</strong>
+                <small>Description + Status match</small>
               </div>
               <div className="simple-match-card not-matching">
                 <div className="simple-match-title">Not Matching</div>
-                <strong>{midpComparison.rows.filter((r) => r.implementationStatus === 'NO').length}</strong>
+                <strong>{midpComparison.summary.overallNotMatching}</strong>
+                <small>Missing in TAJ or Description / Status mismatch</small>
               </div>
             </div>
 
-            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>Expected Action</span><span>TAJ MIDP</span><span>GLS MIDP</span><span>Status</span></div>
-            <div className="checks">{midpComparison.rows
-              .filter((r) => r.implementationStatus === 'YES' || r.implementationStatus === 'NO')
-              .map((r) => <article className="check" key={r.key}>
-              <div className="midp-result-row simple-midp-row">
+            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>GLS Metadata</span><span>TAJ Metadata</span><span>In TAJ</span><span>Description</span><span>Status</span><span>Overall</span></div>
+            <div className="checks">{midpComparison.rows.map((r) => <article className="check" key={r.key}>
+              <div className="midp-result-row metadata-compare-row">
                 <strong>{r.key}</strong>
-                <span>{r.requestedAction}</span>
-                <span title={r.taj?.title || ''}>{r.taj?.title || '—'}</span>
-                <span title={r.gls?.title || ''}>{r.gls?.title || '—'}</span>
-                <span className={r.implementationStatus === 'YES' ? 'implementation-yes' : 'implementation-no'}>{r.implementationStatus === 'YES' ? 'MATCHING' : 'NOT MATCHING'}</span>
+                <span title={r.gls?.description || ''}>{r.gls?.description || '—'}</span>
+                <span title={r.taj?.description || ''}>{r.taj?.description || '—'}</span>
+                <span className={r.existsInTaj ? 'implementation-yes' : 'implementation-no'}>{r.existsInTaj ? 'YES' : 'NO'}</span>
+                <span className={r.existsInTaj && r.descriptionMatch ? 'implementation-yes' : 'implementation-no'}>{r.existsInTaj ? (r.descriptionMatch ? 'MATCH' : 'NOT MATCH') : '—'}</span>
+                <span className={r.existsInTaj && r.statusMatch ? 'implementation-yes' : 'implementation-no'}>{r.existsInTaj ? (r.statusMatch ? 'MATCH' : 'NOT MATCH') : '—'}</span>
+                <span className={r.overallMatch ? 'implementation-yes' : 'implementation-no'}>{r.result}</span>
               </div>
             </article>)}</div>
 
-            <div className="next-check"><div><span className="eyebrow">NEXT STEP</span><h3>MIDP vs Metadata vs PDF</h3><p>Continue with the existing drawing validation workflow using the GLS TIDP.</p></div><button className="primary" onClick={() => { setMidpFiles(glsMidpFiles); setMode('validator'); }}><ArrowRight size={18}/>Continue to drawing checker</button></div>
+            <div className="status-audit-table">
+              <div className="status-audit-head"><span>Status</span><span>GLS Total</span><span>TAJ Total</span></div>
+              {midpComparison.statusTotals.map(([status, values]) => (
+                <div className="status-audit-row" key={status}><strong>{status}</strong><span>{values.gls}</span><span>{values.taj}</span></div>
+              ))}
+            </div>
+
+            <div className="next-check"><div><span className="eyebrow">NEXT TOOL</span><h3>MIDP vs Metadata vs PDF</h3><p>The second checker remains unchanged.</p></div><button className="primary" onClick={() => { setMidpFiles(glsMidpFiles); setMode('validator'); }}><ArrowRight size={18}/>Continue to drawing checker</button></div>
           </section>}
         </main>
         <footer><span>DrawingCheck <b>0.2</b></span><span>Designed for controlled BIM / Document Control review</span></footer>
