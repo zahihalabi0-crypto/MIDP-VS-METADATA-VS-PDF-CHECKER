@@ -87,3 +87,19 @@ footer { min-height:52px; border-top:1px solid #d8d2c7; padding:0 max(5vw,28px);
 .simple-match-card.matching strong{color:#39735f}
 .simple-match-card.not-matching strong{color:#a64b45}
 .simple-midp-row{grid-template-columns:1.15fr .95fr 2fr 2fr 1.15fr}
+
+
+/* GLS Metadata vs TAJ Metadata */
+.metadata-compare-row {
+  grid-template-columns: 1.25fr 2.2fr 2.2fr .8fr 1fr 1fr 1.15fr;
+  align-items: center;
+}
+.metadata-compare-row span,
+.metadata-compare-row strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.metadata-compare-row span[title] {
+  white-space: nowrap;
+}
