@@ -53,7 +53,7 @@ function formatDate(value) {
 
 async function readWorkbook(file) {
   const buffer = await file.arrayBuffer();
-  return XLSX.read(buffer, { type: 'array', cellDates: true });
+  return XLSX.read(buffer, { type: 'array', cellDates: true, cellStyles: true });
 }
 
 function sheetRows(workbook, sheetName) {
@@ -263,24 +263,76 @@ function findDrawingSheet(workbook) {
   });
 }
 
+function normalizeHex(value) {
+  return clean(value).replace(/^#/, '').toUpperCase();
+}
+
+function cellFillColor(cell) {
+  const fg = cell?.s?.fgColor || cell?.s?.fill?.fgColor;
+  if (!fg) return '';
+  if (fg.rgb) return normalizeHex(fg.rgb);
+  if (fg.indexed != null) return String(fg.indexed);
+  return '';
+}
+
+function colorActionFromCell(cell) {
+  const color = cellFillColor(cell);
+  if (!color) return '';
+
+  // Common Excel ARGB/RGB values. Also allow the dominant RGB portion
+  // when the workbook stores an alpha channel.
+  const rgb = color.length === 8 ? color.slice(2) : color;
+
+  if (
+    ['FF0000', 'C00000', 'FF3333', 'F4CCCC', 'FFC7CE'].includes(rgb)
+    || /FF0000$|C00000$/.test(color)
+  ) return 'REMOVE';
+
+  if (
+    ['00FF00', '008000', '70AD47', '92D050', 'C6EFCE'].includes(rgb)
+    || /00FF00$|008000$|92D050$/.test(color)
+  ) return 'ADD';
+
+  if (
+    ['FFFF00', 'FFD966', 'FFF2CC', 'FFC000', 'FFEB9C'].includes(rgb)
+    || /FFFF00$|FFD966$|FFC000$/.test(color)
+  ) return 'MODIFY';
+
+  return '';
+}
+
+function detectRowAction(sheet, rowIndex, columnCount) {
+  const actions = [];
+  for (let c = 0; c < columnCount; c += 1) {
+    const action = colorActionFromCell(sheet?.[XLSX.utils.encode_cell({ r: rowIndex, c })]);
+    if (action && !actions.includes(action)) actions.push(action);
+  }
+  return actions.length === 1 ? actions[0] : actions.length > 1 ? 'MULTIPLE' : '';
+}
+
 function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
   const targetSheet = findDrawingSheet(workbook);
   if (!targetSheet) {
     throw new Error(`No MIDP-DRW-SWD sheet was found. Available sheets: ${workbook.SheetNames.join(', ')}`);
   }
 
+  const worksheet = workbook.Sheets[targetSheet];
   const rows = sheetRows(workbook, targetSheet);
   const headerRow = 3; // Excel Row 4
   if (!rows[headerRow]) throw new Error(`${targetSheet}: Excel Row 4 could not be read.`);
 
-  // Fixed drawing-register structure:
-  // D = Suitability Status, F = Drawing Number, G = Drawing Title,
-  // N = Revision, Z = Sub-Owner.
-  const suitabilityIndex = 3;
-  const docIndex = 5;
-  const titleIndex = 6;
-  const revisionIndex = 13;
-  const ownerIndex = 25;
+  const suitabilityIndex = 3; // D
+  const docIndex = 5;         // F
+  const titleIndex = 6;       // G
+  const revisionIndex = 13;   // N
+  const ownerIndex = 25;      // Z
+
+  const rawHeaders = rows[headerRow].map((h, i) => clean(h) || `Column ${i + 1}`);
+  const normalizedHeaders = rawHeaders.map((h) => clean(h).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim());
+
+  // Prefer the actual column headed "Status" for Code B / Code C / UR checks.
+  const statusHeaderIndex = normalizedHeaders.findIndex((h) => h === 'status' || h === 'submission status' || h.includes('status'));
+  const statusIndex = statusHeaderIndex >= 0 ? statusHeaderIndex : suitabilityIndex;
 
   const records = [];
   const duplicateKeys = new Set();
@@ -296,15 +348,16 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
     if (seen.has(key)) duplicateKeys.add(key);
     seen.add(key);
 
-    // Only the baseline/MIDP is filtered by Sub-Owner = GLS.
     if (filterGLS && clean(row[ownerIndex]).toUpperCase() !== 'GLS') return;
 
     const values = {};
     row.forEach((value, index) => {
-      const header = clean(rows[headerRow][index]) || `Column ${index + 1}`;
+      const header = rawHeaders[index] || `Column ${index + 1}`;
       const cleaned = clean(value);
       if (cleaned) values[header] = cleaned;
     });
+
+    const rowAction = detectRowAction(worksheet, headerRow + 1 + offset, Math.max(rawHeaders.length, row.length));
 
     records.push({
       sourceRow: headerRow + offset + 2,
@@ -313,11 +366,14 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
       base: key,
       title: clean(row[titleIndex]),
       revision: revision(row[revisionIndex]),
-      status: clean(row[suitabilityIndex]),
-      category: clean(row[suitabilityIndex]),
+      status: clean(row[statusIndex]),
+      suitabilityStatus: clean(row[suitabilityIndex]),
+      statusColumn: statusIndex + 1,
+      category: clean(row[statusIndex]),
+      subOwner: clean(row[ownerIndex]),
+      requestedAction: rowAction,
       values,
       headers: Object.keys(values),
-      subOwner: clean(row[ownerIndex]),
     });
   });
 
@@ -352,37 +408,87 @@ function compareMidpRecords(taj, gls) {
     const a = tajMap.get(key);
     const b = glsMap.get(key);
 
-    if (!a) return { key, type: 'added', taj: null, gls: b, changes: ['Entire drawing row added in TIDP'], fieldChanges: [] };
-    if (!b) return { key, type: 'removed', taj: a, gls: null, changes: ['Entire drawing row removed from TIDP'], fieldChanges: [] };
+    if (!a) {
+      const requested = b?.requestedAction || '';
+      return {
+        key, type: 'added', taj: null, gls: b,
+        requestedAction: requested,
+        implementationStatus: requested === 'ADD' ? 'PENDING — drawing expected in MIDP but not found'
+          : requested === 'REMOVE' ? 'UNEXPECTED — drawing is absent from MIDP'
+          : requested === 'MODIFY' ? 'PENDING — modified drawing not found in MIDP'
+          : 'NEW IN TIDP — review required',
+        changes: ['Drawing exists in TIDP but not baseline MIDP'],
+        fieldChanges: [],
+        revisionChanged: false, suitabilityChanged: false, titleChanged: false,
+      };
+    }
+
+    if (!b) {
+      return {
+        key, type: 'removed', taj: a, gls: null,
+        requestedAction: '',
+        implementationStatus: 'UNEXPECTED — drawing exists in MIDP but not in TIDP',
+        changes: ['Drawing exists in baseline MIDP but not updated TIDP'],
+        fieldChanges: [],
+        revisionChanged: false, suitabilityChanged: false, titleChanged: false,
+      };
+    }
 
     const headers = [...new Set([...(a.headers || []), ...(b.headers || [])])];
     const fieldChanges = headers.map((field) => ({
-      field,
-      taj: a.values?.[field] ?? '',
-      gls: b.values?.[field] ?? '',
+      field, taj: a.values?.[field] ?? '', gls: b.values?.[field] ?? '',
     })).filter((x) => normalizeCompareValue(x.taj) !== normalizeCompareValue(x.gls));
 
     const revisionChanged = normalizeCompareValue(a.revision) !== normalizeCompareValue(b.revision);
     const suitabilityChanged = normalizeCompareValue(a.status) !== normalizeCompareValue(b.status);
     const titleChanged = normalizeCompareValue(a.title) !== normalizeCompareValue(b.title);
 
+    const requestedAction = b.requestedAction || '';
+    let implementationStatus = 'NO REQUESTED COLOUR';
+    if (requestedAction === 'REMOVE') {
+      implementationStatus = 'NOT IMPLEMENTED — drawing still exists in MIDP';
+    } else if (requestedAction === 'ADD') {
+      implementationStatus = 'NOT IMPLEMENTED — drawing already existed in MIDP';
+    } else if (requestedAction === 'MODIFY') {
+      implementationStatus = (revisionChanged || suitabilityChanged || titleChanged || fieldChanges.length)
+        ? 'CHANGE DETECTED — review implementation'
+        : 'NOT IMPLEMENTED — no change detected';
+    } else if (revisionChanged || suitabilityChanged || titleChanged) {
+      implementationStatus = 'CHANGE DETECTED — review';
+    } else {
+      implementationStatus = 'NO CHANGE';
+    }
+
     return {
-      key,
-      type: fieldChanges.length ? 'changed' : 'unchanged',
-      taj: a,
-      gls: b,
-      changes: fieldChanges.map((x) => x.field),
-      fieldChanges,
-      revisionChanged,
-      suitabilityChanged,
-      titleChanged,
+      key, type: fieldChanges.length ? 'changed' : 'unchanged',
+      taj: a, gls: b, requestedAction, implementationStatus,
+      changes: fieldChanges.map((x) => x.field), fieldChanges,
+      revisionChanged, suitabilityChanged, titleChanged,
     };
   });
 }
 
 function midpSummary(records) {
-  const summary = { total: records.length, UR: 0, 'Code B': 0, 'Code C': 0, 'Code D': 0, NYS: 0, Other: 0 };
-  records.forEach((r) => { if (summary[r.category] != null) summary[r.category] += 1; else summary.Other += 1; });
+  const summary = {
+    total: records.length,
+    UR: 0, 'Code B': 0, 'Code C': 0, 'Code D': 0, NYS: 0,
+    ADD: 0, REMOVE: 0, MODIFY: 0, Other: 0
+  };
+
+  records.forEach((r) => {
+    const status = normalizeCompareValue(r.status);
+    if (/^UR$|UNDER REVIEW/.test(status)) summary.UR += 1;
+    else if (/CODE\\s*B|^B$/.test(status)) summary['Code B'] += 1;
+    else if (/CODE\\s*C|^C$/.test(status)) summary['Code C'] += 1;
+    else if (/CODE\\s*D|^D$/.test(status)) summary['Code D'] += 1;
+    else if (/NYS|NOT YET SUBMITTED/.test(status)) summary.NYS += 1;
+    else summary.Other += 1;
+
+    if (r.requestedAction === 'ADD') summary.ADD += 1;
+    else if (r.requestedAction === 'REMOVE') summary.REMOVE += 1;
+    else if (r.requestedAction === 'MODIFY') summary.MODIFY += 1;
+  });
+
   return summary;
 }
 
@@ -477,7 +583,7 @@ function App() {
           changed: rows.filter((r) => r.type === 'changed').length,
           unchanged: rows.filter((r) => r.type === 'unchanged').length,
         },
-        filterLabel: 'Baseline MIDP: Column Z (Sub-Owner) = GLS; Updated TIDP: no Sub-Owner filter'
+        filterLabel: 'Baseline MIDP: Column Z (Sub-Owner) = GLS; Updated TIDP: no Sub-Owner filter; TIDP colours = red Remove, green Add, yellow Modify'
       });
     } catch (e) {
       setMidpError(e.message || 'The MIDP/TIDP files could not be compared.');
@@ -488,18 +594,20 @@ function App() {
   function downloadMidpReport() {
     if (!midpComparison) return;
 
-    const makeSheet = (rows) => XLSX.utils.json_to_sheet(rows.length ? rows : [{ 'Drawing Number': 'No records' }]);
+    const makeSheet = (rows) => XLSX.utils.json_to_sheet(rows.length ? rows : [{ 'DRAWING NUMBER': 'No records' }]);
 
     const fullSummary = midpComparison.rows.map((r) => ({
       'DRAWING NUMBER': r.key,
+      'Requested Action (TIDP Colour)': r.requestedAction || '—',
+      'Implementation Status': r.implementationStatus,
       'MIDP DRAWING TITLE': r.taj?.title || '',
       'TIDP DRAWING TITLE': r.gls?.title || '',
       'MIDP Revision': r.taj?.revision || '',
       'TIDP Revision': r.gls?.revision || '',
-      'MIDP Suitability Status': r.taj?.status || '',
-      'TIDP Suitability Status': r.gls?.status || '',
+      'MIDP Status': r.taj?.status || '',
+      'TIDP Status': r.gls?.status || '',
       'Revision Changed': r.revisionChanged ? 'YES' : 'NO',
-      'Suitability Changed': r.suitabilityChanged ? 'YES' : 'NO',
+      'Status Changed': r.suitabilityChanged ? 'YES' : 'NO',
       'Title Changed': r.titleChanged ? 'YES' : 'NO',
       'Comparison Status': r.type === 'added' ? 'ADDED'
         : r.type === 'removed' ? 'REMOVED'
@@ -507,33 +615,39 @@ function App() {
         : r.titleChanged ? 'TITLE CHANGED' : 'UNCHANGED',
     }));
 
-    const added = midpComparison.rows.filter((r) => r.type === 'added').map((r) => ({
+    const added = midpComparison.rows.filter((r) => r.type === 'added' || r.requestedAction === 'ADD').map((r) => ({
       'DRAWING NUMBER': r.key,
-      'DRAWING TITLE': r.gls?.title || '',
-      'Revision': r.gls?.revision || '',
-      'SUITABILITY STATUS': r.gls?.status || '',
-      'Source Sheet / Row': r.gls ? `${r.gls.sheet} / ${r.gls.sourceRow}` : '',
+      'Requested Action': r.requestedAction || 'ADD',
+      'Implementation Status': r.implementationStatus,
+      'DRAWING TITLE': r.gls?.title || r.taj?.title || '',
+      'Revision': r.gls?.revision || r.taj?.revision || '',
+      'Status': r.gls?.status || r.taj?.status || '',
     }));
 
     const revisionMismatches = midpComparison.rows
-      .filter((r) => r.type === 'changed' && (r.revisionChanged || r.suitabilityChanged))
+      .filter((r) => r.revisionChanged || r.suitabilityChanged || r.titleChanged)
       .map((r) => ({
         'DRAWING NUMBER': r.key,
+        'Requested Action': r.requestedAction || '',
+        'Implementation Status': r.implementationStatus,
         'MIDP Revision': r.taj?.revision || '',
         'TIDP Revision': r.gls?.revision || '',
-        'MIDP Suitability Status': r.taj?.status || '',
-        'TIDP Suitability Status': r.gls?.status || '',
+        'MIDP Status': r.taj?.status || '',
+        'TIDP Status': r.gls?.status || '',
         'Revision Changed': r.revisionChanged ? 'YES' : 'NO',
-        'Suitability Changed': r.suitabilityChanged ? 'YES' : 'NO',
-        'Source': `${r.taj?.sheet || ''} / ${r.taj?.sourceRow || ''} → ${r.gls?.sheet || ''} / ${r.gls?.sourceRow || ''}`,
+        'Status Changed': r.suitabilityChanged ? 'YES' : 'NO',
+        'Title Changed': r.titleChanged ? 'YES' : 'NO',
+        'MIDP Title': r.taj?.title || '',
+        'TIDP Title': r.gls?.title || '',
       }));
 
-    const missing = midpComparison.rows.filter((r) => r.type === 'removed').map((r) => ({
+    const missing = midpComparison.rows.filter((r) => r.type === 'removed' || r.requestedAction === 'REMOVE').map((r) => ({
       'DRAWING NUMBER': r.key,
-      'DRAWING TITLE': r.taj?.title || '',
-      'Revision': r.taj?.revision || '',
-      'SUITABILITY STATUS': r.taj?.status || '',
-      'Source Sheet / Row': r.taj ? `${r.taj.sheet} / ${r.taj.sourceRow}` : '',
+      'Requested Action': r.requestedAction || 'REMOVE',
+      'Implementation Status': r.implementationStatus,
+      'DRAWING TITLE': r.taj?.title || r.gls?.title || '',
+      'Revision': r.taj?.revision || r.gls?.revision || '',
+      'Status': r.taj?.status || r.gls?.status || '',
     }));
 
     const duplicates = [
@@ -585,7 +699,7 @@ function App() {
         <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>BIM document validation</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
         <main>
           {!midpComparison ? <section className="workspace">
-            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS TIDP</h2><p>Compare drawing deliverables from MIDP-DRW-SWD. Baseline MIDP = Sub-Owner GLS; updated TIDP = no Sub-Owner filter.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
+            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS TIDP</h2><p>Compare drawing deliverables from MIDP-DRW-SWD. Baseline MIDP = Sub-Owner GLS; updated TIDP = no Sub-Owner filter. TIDP colour marks are used as the weekly requested-change instruction.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
             <div className="drop-grid midp-upload-grid">
               <DropZone title="TAJ MIDP" subtitle="TAJ Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={tajMidpFiles} onFiles={(f) => setTajMidpFiles(f.slice(0,1))} color="#c77645" />
               <DropZone title="GLS TIDP" subtitle="Glassline Task Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
@@ -594,13 +708,13 @@ function App() {
             <button className="primary" disabled={!tajMidpFiles.length || !glsMidpFiles.length || midpLoading} onClick={runMidpComparison}>{midpLoading ? <><LoaderCircle className="spin"/>Comparing MIDPs…</> : <>Compare TAJ vs GLS <ArrowRight size={18}/></>}</button>
             <p className="helper"><Info size={13}/> The comparison is processed locally in your browser.</p>
           </section> : <section className="results midp-results">
-            <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS TIDP</h2><p>Drawing deliverable differences, revision/status changes, title changes, additions and removals.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
+            <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS TIDP</h2><p>Weekly implementation audit: TIDP colour marks requested ADD / REMOVE / MODIFY actions; the current TAJ MIDP is checked to confirm whether those requests were implemented.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
             <div className="gls-filter-note"><strong>Filter:</strong> {midpComparison.filterLabel} <span>•</span> Drawing rows are matched by Drawing Number; every populated column is checked for changes.</div>
-            <div className="midp-summary-columns"><MidpSummaryCard title="TAJ MIDP" summary={midpComparison.tajSummary} /><MidpSummaryCard title="GLS TIDP" summary={midpComparison.glsSummary} /></div>
+            <div className="midp-summary-columns"><MidpSummaryCard title="TAJ MIDP" summary={midpComparison.tajSummary} /><MidpSummaryCard title="GLS TIDP" summary={midpComparison.glsSummary} /></div><div className="gls-filter-note"><strong>Weekly audit logic:</strong> Red = requested removal, Green = requested addition, Yellow = requested modification. Status is read from the column headed “Status” and checked for values such as UR, Code B and Code C. Drawing-title changes are also explicitly checked.</div>
             <div className="midp-change-grid"><div><small>Added in GLS</small><strong>{midpComparison.counts.added}</strong></div><div><small>Removed from GLS</small><strong>{midpComparison.counts.removed}</strong></div><div><small>Changed</small><strong>{midpComparison.counts.changed}</strong></div><div><small>Unchanged</small><strong>{midpComparison.counts.unchanged}</strong></div></div>
-            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>TAJ Status</span><span>GLS Status</span><span>Fields Changed</span><span>Result</span></div>
+            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>TAJ Status</span><span>TIDP Status</span><span>Requested</span><span>Implementation</span></div>
             <div className="checks">{midpComparison.rows.map((r) => <article className="check" key={r.key}>
-              <div className="midp-result-row"><strong>{r.key}</strong><span>{r.taj?.category || '—'}</span><span>{r.gls?.category || '—'}</span><span>{r.type === 'changed' ? `${r.fieldChanges.length} field change${r.fieldChanges.length !== 1 ? 's' : ''}` : r.changes.join(', ')}</span><StatusBadge status={r.type === 'unchanged' ? 'pass' : r.type === 'changed' ? 'warning' : 'fail'} count={r.type} /></div>
+              <div className="midp-result-row"><strong>{r.key}</strong><span>{r.taj?.status || '—'}</span><span>{r.gls?.status || '—'}</span><span>{r.requestedAction || '—'}</span><span title={r.implementationStatus}>{r.implementationStatus}</span></div>
               {r.type === 'changed' && <div className="midp-field-changes">
                 {r.fieldChanges.map((c) => <div className="midp-field-change" key={c.field}><strong>{c.field}</strong><span title={c.taj || ''}>{c.taj || '—'}</span><span title={c.gls || ''}>{c.gls || '—'}</span></div>)}
               </div>}
