@@ -413,10 +413,10 @@ function compareMidpRecords(taj, gls) {
       return {
         key, type: 'added', taj: null, gls: b,
         requestedAction: requested,
-        implementationStatus: requested === 'ADD' ? 'PENDING — drawing expected in MIDP but not found'
-          : requested === 'REMOVE' ? 'UNEXPECTED — drawing is absent from MIDP'
-          : requested === 'MODIFY' ? 'PENDING — modified drawing not found in MIDP'
-          : 'NEW IN TIDP — review required',
+        implementationStatus: requested === 'ADD' ? 'NOT IMPLEMENTED'
+          : requested === 'REMOVE' ? 'IMPLEMENTED'
+          : requested === 'MODIFY' ? 'NOT IMPLEMENTED'
+          : 'CHECK',
         changes: ['Drawing exists in TIDP but not baseline MIDP'],
         fieldChanges: [],
         revisionChanged: false, suitabilityChanged: false, titleChanged: false,
@@ -427,7 +427,7 @@ function compareMidpRecords(taj, gls) {
       return {
         key, type: 'removed', taj: a, gls: null,
         requestedAction: '',
-        implementationStatus: 'UNEXPECTED — drawing exists in MIDP but not in TIDP',
+        implementationStatus: 'CHECK',
         changes: ['Drawing exists in baseline MIDP but not updated TIDP'],
         fieldChanges: [],
         revisionChanged: false, suitabilityChanged: false, titleChanged: false,
@@ -446,17 +446,17 @@ function compareMidpRecords(taj, gls) {
     const requestedAction = b.requestedAction || '';
     let implementationStatus = 'NO REQUESTED COLOUR';
     if (requestedAction === 'REMOVE') {
-      implementationStatus = 'NOT IMPLEMENTED — drawing still exists in MIDP';
+      implementationStatus = 'NOT IMPLEMENTED';
     } else if (requestedAction === 'ADD') {
-      implementationStatus = 'NOT IMPLEMENTED — drawing already existed in MIDP';
+      implementationStatus = 'IMPLEMENTED';
     } else if (requestedAction === 'MODIFY') {
       implementationStatus = (revisionChanged || suitabilityChanged || titleChanged || fieldChanges.length)
-        ? 'CHANGE DETECTED — review implementation'
-        : 'NOT IMPLEMENTED — no change detected';
+        ? 'IMPLEMENTED'
+        : 'NOT IMPLEMENTED';
     } else if (revisionChanged || suitabilityChanged || titleChanged) {
-      implementationStatus = 'CHANGE DETECTED — review';
+      implementationStatus = 'NOT MATCHING';
     } else {
-      implementationStatus = 'NO CHANGE';
+      implementationStatus = 'MATCHING';
     }
 
     return {
