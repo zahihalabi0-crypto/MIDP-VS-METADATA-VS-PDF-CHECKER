@@ -251,9 +251,16 @@ function normalizeCompareValue(value) {
 }
 
 function findDrawingSheet(workbook) {
-  const exact = workbook.SheetNames.find((name) => /^MIDP-DRW-SWD$/i.test(clean(name)));
+  // Both TAJ MIDP and GLS TIDP use this drawing-register sheet.
+  // Prefer it explicitly; do not rely on generic MIDP/TIDP sheet matching.
+  const exact = workbook.SheetNames.find((name) => clean(name).toUpperCase() === 'MIDP-DRW-SWD');
   if (exact) return exact;
-  return workbook.SheetNames.find((name) => /^(MIDP|TIDP).*(DRW|SWD)|^(MIDP|TIDP)$/i.test(clean(name)));
+
+  // Fallback only if the workbook uses a slightly different sheet name.
+  return workbook.SheetNames.find((name) => {
+    const n = clean(name).toUpperCase();
+    return n.includes('MIDP-DRW-SWD') || n.includes('MIDP') && n.includes('DRW');
+  });
 }
 
 function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
