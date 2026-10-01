@@ -792,16 +792,27 @@ function App() {
               <div><small>TIDP / MIDP Drawings</small><strong>{midpComparison.glsSummary.total} / {midpComparison.tajSummary.total}</strong></div>
             </div>
 
-            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>GLS Expected Action</span><span>TAJ Drawing Title</span><span>TIDP Drawing Title</span><span>TAJ Status</span><span>TIDP Status</span><span>TAJ Implemented?</span></div>
-            <div className="checks">{midpComparison.rows.map((r) => <article className="check" key={r.key}>
-              <div className="midp-result-row">
+            <div className="simple-match-summary">
+              <div className="simple-match-card matching">
+                <div className="simple-match-title">Matching</div>
+                <strong>{midpComparison.rows.filter((r) => r.implementationStatus === 'YES').length}</strong>
+              </div>
+              <div className="simple-match-card not-matching">
+                <div className="simple-match-title">Not Matching</div>
+                <strong>{midpComparison.rows.filter((r) => r.implementationStatus === 'NO').length}</strong>
+              </div>
+            </div>
+
+            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>Expected Action</span><span>TAJ MIDP</span><span>GLS MIDP</span><span>Status</span></div>
+            <div className="checks">{midpComparison.rows
+              .filter((r) => r.implementationStatus === 'YES' || r.implementationStatus === 'NO')
+              .map((r) => <article className="check" key={r.key}>
+              <div className="midp-result-row simple-midp-row">
                 <strong>{r.key}</strong>
                 <span>{r.requestedAction}</span>
                 <span title={r.taj?.title || ''}>{r.taj?.title || '—'}</span>
                 <span title={r.gls?.title || ''}>{r.gls?.title || '—'}</span>
-                <span title="Column K — Status">{statusFromColumnK(r.taj) || '—'}</span>
-                <span title="Column K — Status">{statusFromColumnK(r.gls) || '—'}</span>
-                <span className={r.implementationStatus === 'YES' ? 'implementation-yes' : r.implementationStatus === 'NO' ? 'implementation-no' : ''}>{r.implementationStatus}</span>
+                <span className={r.implementationStatus === 'YES' ? 'implementation-yes' : 'implementation-no'}>{r.implementationStatus === 'YES' ? 'MATCHING' : 'NOT MATCHING'}</span>
               </div>
             </article>)}</div>
 
