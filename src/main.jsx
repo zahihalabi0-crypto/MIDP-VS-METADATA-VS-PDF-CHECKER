@@ -274,17 +274,11 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
   const ownerIndex = 25; // Column Z
   let headerRow = -1;
 
-  // For the TAJ MIDP, Column Z is authoritative. For TIDP, we only need
-  // the drawing register itself because all rows belong to GLS.
-  if (filterGLS) {
-    for (let r = 0; r < Math.min(rows.length, 80); r += 1) {
-      if (isOwnerHeader(rows[r]?.[ownerIndex])) { headerRow = r; break; }
-    }
-  }
-  if (headerRow < 0) {
-    for (let r = 0; r < Math.min(rows.length, 80); r += 1) {
-      if (rows[r].some(isDrawingHeader)) { headerRow = r; break; }
-    }
+  // Always identify the register header from DRAWING NUMBER.
+  // Column Z is used only as a filter for the TAJ MIDP.
+  // The GLS TIDP is already GLS-only and is never filtered by Column Z.
+  for (let r = 0; r < Math.min(rows.length, 100); r += 1) {
+    if (rows[r].some(isDrawingHeader)) { headerRow = r; break; }
   }
   if (headerRow < 0) {
     throw new Error(`${targetSheet} was found, but the drawing register header row could not be identified.`);
@@ -309,7 +303,7 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
     const doc = clean(row[docIndex]);
     const subOwner = clean(row[ownerIndex]);
 
-    if (filterGLS && !/^GLS$/i.test(subOwner)) return;
+    if (filterGLS && clean(subOwner).toUpperCase() !== 'GLS') return;
     if (!doc) return;
 
     scopedRows += 1;
@@ -337,7 +331,7 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
 
   if (!records.length) {
     throw new Error(filterGLS
-      ? `${targetSheet} was read successfully, but no GLS rows were found. Column Z (Sub-Owner) must equal GLS. Rows with GLS in Column Z: 0.`
+      ? `${targetSheet} was read successfully, but no GLS rows were found. The TAJ MIDP is filtered ONLY by Column Z (Sub-Owner) = GLS. The GLS TIDP is NOT filtered by Column Z.`
       : `${targetSheet} was read successfully, but no drawing rows were found.`);
   }
 
