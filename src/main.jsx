@@ -263,128 +263,119 @@ function findDrawingSheet(workbook) {
   });
 }
 
-function parseDrawingRegister(workbook) {
+function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
   const targetSheet = findDrawingSheet(workbook);
   if (!targetSheet) {
-    throw new Error(`No MIDP/TIDP drawing register sheet was found. Available sheets: ${workbook.SheetNames.join(', ')}`);
+    throw new Error(`No MIDP-DRW-SWD sheet was found. Available sheets: ${workbook.SheetNames.join(', ')}`);
   }
 
   const rows = sheetRows(workbook, targetSheet);
-  const normalizeHeader = (v) => clean(v).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-  const isOwnerHeader = (v) => normalizeHeader(v).includes('sub owner');
-  const isDrawingHeader = (v) => {
-    const h = normalizeHeader(v);
-    return h === 'drawing number' || h === 'drawing no' || h === 'document number' ||
-      h === 'document no' || h.includes('drawing number') || h.includes('document number');
-  };
+  const headerRow = 3; // Excel Row 4
+  if (!rows[headerRow]) throw new Error(`${targetSheet}: Excel Row 4 could not be read.`);
 
-  // TAJ MIDP: Column Z (index 25) identifies the drawing owner.
-  // Use the physical Excel Column Z regardless of the header text.
+  // Fixed drawing-register structure:
+  // D = Suitability Status, F = Drawing Number, G = Drawing Title,
+  // N = Revision, Z = Sub-Owner.
+  const suitabilityIndex = 3;
+  const docIndex = 5;
+  const titleIndex = 6;
+  const revisionIndex = 13;
   const ownerIndex = 25;
-  let headerRow = -1;
-
-  // Identify the register header from DRAWING NUMBER only.
-  // Column Z is a fixed data-column filter for TAJ MIDP; it does not need
-  // to contain the "Sub Owner" label on the same physical Excel row.
-  // GLS TIDP is not filtered by Column Z.
-  for (let r = 0; r < Math.min(rows.length, 150); r += 1) {
-    if (rows[r].some(isDrawingHeader)) {
-      headerRow = r;
-      break;
-    }
-  }
-  if (headerRow < 0) {
-    throw new Error(`${targetSheet} was found, but the drawing register header row could not be identified.`);
-  }
-
-  const rawHeaders = rows[headerRow].map((h, i) => clean(h) || `Column ${i + 1}`);
-  let docIndex = rawHeaders.findIndex(isDrawingHeader);
-
-  if (docIndex < 0) {
-    throw new Error(`${targetSheet}: DRAWING NUMBER column could not be identified. Headers: ${rawHeaders.filter(Boolean).join(' | ')}`);
-  }
-
-  const statusIndex = headerIndex(rawHeaders, ['status', 'submission status', 'document status']);
-  const codeIndex = headerIndex(rawHeaders, ['code', 'status code', 'document code', 'code b/c', 'approval code']);
-  const titleIndex = headerIndex(rawHeaders, ['title', 'drawing title', 'document title', 'description']);
-  const revisionIndex = headerIndex(rawHeaders, ['revision', 'rev']);
 
   const records = [];
-  let scopedRows = 0;
+  const duplicateKeys = new Set();
+  const seen = new Set();
 
   rows.slice(headerRow + 1).forEach((row, offset) => {
     const doc = clean(row[docIndex]);
     if (!doc) return;
 
-    scopedRows += 1;
+    const key = baseNumber(doc);
+    if (!key) return;
+
+    if (seen.has(key)) duplicateKeys.add(key);
+    seen.add(key);
+
+    // Only the baseline/MIDP is filtered by Sub-Owner = GLS.
+    if (filterGLS && clean(row[ownerIndex]).toUpperCase() !== 'GLS') return;
 
     const values = {};
-    rawHeaders.forEach((header, i) => {
-      const value = clean(row[i]);
-      if (value) values[header] = value;
+    row.forEach((value, index) => {
+      const header = clean(rows[headerRow][index]) || `Column ${index + 1}`;
+      const cleaned = clean(value);
+      if (cleaned) values[header] = cleaned;
     });
 
     records.push({
       sourceRow: headerRow + offset + 2,
       sheet: targetSheet,
       doc,
-      base: baseNumber(doc),
-      title: titleIndex >= 0 ? clean(row[titleIndex]) : '',
-      revision: revisionIndex >= 0 ? revision(row[revisionIndex]) : '',
-      status: statusIndex >= 0 ? clean(row[statusIndex]) : '',
-      code: codeIndex >= 0 ? clean(row[codeIndex]) : '',
-      category: midpCategory(row, statusIndex, codeIndex),
+      base: key,
+      title: clean(row[titleIndex]),
+      revision: revision(row[revisionIndex]),
+      status: clean(row[suitabilityIndex]),
+      category: clean(row[suitabilityIndex]),
       values,
       headers: Object.keys(values),
+      subOwner: clean(row[ownerIndex]),
     });
   });
 
   if (!records.length) {
-    throw new Error(targetSheet + ' was read successfully, but no drawing rows were found.');
+    throw new Error(filterGLS
+      ? `${targetSheet} was read successfully, but no drawing rows with Sub-Owner = GLS were found.`
+      : `${targetSheet} was read successfully, but no drawing rows were found.`);
   }
 
-  ds exist for the same drawing, prefer PDF.
   const map = new Map();
   records.forEach((record) => {
-    const existing = map.get(record.base);
-    if (!existing || /-PDF$/i.test(record.doc)) map.set(record.base, record);
+    if (!map.has(record.base)) map.set(record.base, record);
   });
 
-  return [...map.values()];
+  return { records: [...map.values()], duplicates: [...duplicateKeys].sort(), totalRows: records.length };
 }
 
 function parseTajMidp(workbook) {
-  return parseDrawingRegister(workbook);
+  return parseDrawingRegister(workbook, { filterGLS: true });
 }
 
 function parseGlsTidp(workbook) {
-  return parseDrawingRegister(workbook);
+  return parseDrawingRegister(workbook, { filterGLS: false });
 }
+
 function compareMidpRecords(taj, gls) {
-  const tajMap = new Map(taj.map((r) => [r.base, r]));
-  const glsMap = new Map(gls.map((r) => [r.base, r]));
+  const tajMap = new Map(taj.records.map((r) => [r.base, r]));
+  const glsMap = new Map(gls.records.map((r) => [r.base, r]));
   const keys = [...new Set([...tajMap.keys(), ...glsMap.keys()])].sort();
 
   return keys.map((key) => {
-    const a = tajMap.get(key), b = glsMap.get(key);
-    if (!a) return { key, type: 'added', taj: null, gls: b, changes: ['Entire drawing row added in GLS'], fieldChanges: [] };
-    if (!b) return { key, type: 'removed', taj: a, gls: null, changes: ['Entire drawing row removed from GLS'], fieldChanges: [] };
+    const a = tajMap.get(key);
+    const b = glsMap.get(key);
+
+    if (!a) return { key, type: 'added', taj: null, gls: b, changes: ['Entire drawing row added in TIDP'], fieldChanges: [] };
+    if (!b) return { key, type: 'removed', taj: a, gls: null, changes: ['Entire drawing row removed from TIDP'], fieldChanges: [] };
 
     const headers = [...new Set([...(a.headers || []), ...(b.headers || [])])];
-    const fieldChanges = headers.map((field) => {
-      const av = a.values?.[field] ?? '';
-      const bv = b.values?.[field] ?? '';
-      return { field, taj: av, gls: bv };
-    }).filter((x) => normalizeCompareValue(x.taj) !== normalizeCompareValue(x.gls));
+    const fieldChanges = headers.map((field) => ({
+      field,
+      taj: a.values?.[field] ?? '',
+      gls: b.values?.[field] ?? '',
+    })).filter((x) => normalizeCompareValue(x.taj) !== normalizeCompareValue(x.gls));
 
-    const changes = fieldChanges.map((x) => x.field);
+    const revisionChanged = normalizeCompareValue(a.revision) !== normalizeCompareValue(b.revision);
+    const suitabilityChanged = normalizeCompareValue(a.status) !== normalizeCompareValue(b.status);
+    const titleChanged = normalizeCompareValue(a.title) !== normalizeCompareValue(b.title);
+
     return {
       key,
       type: fieldChanges.length ? 'changed' : 'unchanged',
       taj: a,
       gls: b,
-      changes,
+      changes: fieldChanges.map((x) => x.field),
       fieldChanges,
+      revisionChanged,
+      suitabilityChanged,
+      titleChanged,
     };
   });
 }
@@ -468,54 +459,96 @@ function App() {
     setMidpLoading(true); setMidpError(''); setMidpComparison(null);
     try {
       const [tajBook, glsBook] = await Promise.all([readWorkbook(tajMidpFiles[0]), readWorkbook(glsMidpFiles[0])]);
-      const [taj, gls] = [parseTajMidp(tajBook), parseGlsTidp(glsBook)];
-      if (!taj.length || !gls.length) { const emptySide = !taj.length && !gls.length ? 'both TAJ and GLS' : !taj.length ? 'TAJ' : 'GLS'; throw new Error(`No GLS shop-drawing rows were found in the ${emptySide} MIDP. The tool checks MIDP-DRW-SWD and filters column Z (Sub-Owner) for exactly GLS.`); }
+      const taj = parseTajMidp(tajBook);
+      const gls = parseGlsTidp(glsBook);
       const rows = compareMidpRecords(taj, gls);
-      setMidpComparison({ taj, gls, rows, tajSummary: midpSummary(taj), glsSummary: midpSummary(gls),
-        counts: { added: rows.filter((r) => r.type === 'added').length, removed: rows.filter((r) => r.type === 'removed').length, changed: rows.filter((r) => r.type === 'changed').length, unchanged: rows.filter((r) => r.type === 'unchanged').length },
-        filterLabel: 'TAJ MIDP: MIDP-DRW-SWD → Column Z (Sub-Owner) = GLS; GLS TIDP: all drawing rows'
+
+      setMidpComparison({
+        taj: taj.records,
+        gls: gls.records,
+        tajDuplicates: taj.duplicates,
+        glsDuplicates: gls.duplicates,
+        rows,
+        tajSummary: midpSummary(taj.records),
+        glsSummary: midpSummary(gls.records),
+        counts: {
+          added: rows.filter((r) => r.type === 'added').length,
+          removed: rows.filter((r) => r.type === 'removed').length,
+          changed: rows.filter((r) => r.type === 'changed').length,
+          unchanged: rows.filter((r) => r.type === 'unchanged').length,
+        },
+        filterLabel: 'Baseline MIDP: Column Z (Sub-Owner) = GLS; Updated TIDP: no Sub-Owner filter'
       });
-    } catch (e) { setMidpError(e.message || 'The MIDP files could not be compared.'); }
+    } catch (e) {
+      setMidpError(e.message || 'The MIDP/TIDP files could not be compared.');
+    }
     finally { setMidpLoading(false); }
   }
+
   function downloadMidpReport() {
     if (!midpComparison) return;
-    const data = midpComparison.rows.flatMap((r) => {
-      if (r.type === 'added' || r.type === 'removed') {
-        const record = r.type === 'added' ? r.gls : r.taj;
-        return [{
-          'Drawing Number': r.key,
-          'Comparison Result': r.type.toUpperCase(),
-          'Changed Field': 'Entire row',
-          'TAJ Value': r.taj ? Object.values(r.taj.values || {}).join(' | ') : '',
-          'GLS Value': r.gls ? Object.values(r.gls.values || {}).join(' | ') : '',
-          'Source Sheet / Row': record ? `${record.sheet} / ${record.sourceRow}` : '',
-        }];
-      }
-      if (r.type === 'unchanged') {
-        return [{
-          'Drawing Number': r.key,
-          'Comparison Result': 'UNCHANGED',
-          'Changed Field': '',
-          'TAJ Value': '',
-          'GLS Value': '',
-          'Source Sheet / Row': `${r.taj.sheet} / ${r.taj.sourceRow}`,
-        }];
-      }
-      return r.fieldChanges.map((c) => ({
-        'Drawing Number': r.key,
-        'Comparison Result': 'CHANGED',
-        'Changed Field': c.field,
-        'TAJ Value': c.taj,
-        'GLS Value': c.gls,
-        'Source Sheet / Row': `${r.taj.sheet} / ${r.taj.sourceRow} → ${r.gls.sheet} / ${r.gls.sourceRow}`,
+
+    const makeSheet = (rows) => XLSX.utils.json_to_sheet(rows.length ? rows : [{ 'Drawing Number': 'No records' }]);
+
+    const fullSummary = midpComparison.rows.map((r) => ({
+      'DRAWING NUMBER': r.key,
+      'MIDP DRAWING TITLE': r.taj?.title || '',
+      'TIDP DRAWING TITLE': r.gls?.title || '',
+      'MIDP Revision': r.taj?.revision || '',
+      'TIDP Revision': r.gls?.revision || '',
+      'MIDP Suitability Status': r.taj?.status || '',
+      'TIDP Suitability Status': r.gls?.status || '',
+      'Revision Changed': r.revisionChanged ? 'YES' : 'NO',
+      'Suitability Changed': r.suitabilityChanged ? 'YES' : 'NO',
+      'Title Changed': r.titleChanged ? 'YES' : 'NO',
+      'Comparison Status': r.type === 'added' ? 'ADDED'
+        : r.type === 'removed' ? 'REMOVED'
+        : r.revisionChanged || r.suitabilityChanged ? 'REVISION / STATUS CHANGED'
+        : r.titleChanged ? 'TITLE CHANGED' : 'UNCHANGED',
+    }));
+
+    const added = midpComparison.rows.filter((r) => r.type === 'added').map((r) => ({
+      'DRAWING NUMBER': r.key,
+      'DRAWING TITLE': r.gls?.title || '',
+      'Revision': r.gls?.revision || '',
+      'SUITABILITY STATUS': r.gls?.status || '',
+      'Source Sheet / Row': r.gls ? `${r.gls.sheet} / ${r.gls.sourceRow}` : '',
+    }));
+
+    const revisionMismatches = midpComparison.rows
+      .filter((r) => r.type === 'changed' && (r.revisionChanged || r.suitabilityChanged))
+      .map((r) => ({
+        'DRAWING NUMBER': r.key,
+        'MIDP Revision': r.taj?.revision || '',
+        'TIDP Revision': r.gls?.revision || '',
+        'MIDP Suitability Status': r.taj?.status || '',
+        'TIDP Suitability Status': r.gls?.status || '',
+        'Revision Changed': r.revisionChanged ? 'YES' : 'NO',
+        'Suitability Changed': r.suitabilityChanged ? 'YES' : 'NO',
+        'Source': `${r.taj?.sheet || ''} / ${r.taj?.sourceRow || ''} → ${r.gls?.sheet || ''} / ${r.gls?.sourceRow || ''}`,
       }));
-    });
-    const ws = XLSX.utils.json_to_sheet(data);
-    ws['!cols'] = [{wch:50},{wch:18},{wch:35},{wch:65},{wch:65},{wch:45}];
+
+    const missing = midpComparison.rows.filter((r) => r.type === 'removed').map((r) => ({
+      'DRAWING NUMBER': r.key,
+      'DRAWING TITLE': r.taj?.title || '',
+      'Revision': r.taj?.revision || '',
+      'SUITABILITY STATUS': r.taj?.status || '',
+      'Source Sheet / Row': r.taj ? `${r.taj.sheet} / ${r.taj.sourceRow}` : '',
+    }));
+
+    const duplicates = [
+      ...midpComparison.tajDuplicates.map((d) => ({ Source: 'Baseline MIDP', 'DRAWING NUMBER': d })),
+      ...midpComparison.glsDuplicates.map((d) => ({ Source: 'Updated TIDP', 'DRAWING NUMBER': d })),
+    ];
+
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'TAJ vs GLS');
-    XLSX.writeFile(wb, 'TAJ_vs_GLS_TIDP_' + new Date().toISOString().slice(0,10) + '.xlsx');
+    XLSX.utils.book_append_sheet(wb, makeSheet(fullSummary), 'Full Summary');
+    XLSX.utils.book_append_sheet(wb, makeSheet(added), 'Added Drawings');
+    XLSX.utils.book_append_sheet(wb, makeSheet(revisionMismatches), 'Revision Mismatches');
+    XLSX.utils.book_append_sheet(wb, makeSheet(missing), 'Missing Drawings');
+    if (duplicates.length) XLSX.utils.book_append_sheet(wb, makeSheet(duplicates), 'Duplicate Drawings');
+
+    XLSX.writeFile(wb, `MIDP_vs_TIDP_Comparison_Report_${new Date().toISOString().slice(0,10)}.xlsx`);
   }
 
   async function runCheck() {
@@ -552,7 +585,7 @@ function App() {
         <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>BIM document validation</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
         <main>
           {!midpComparison ? <section className="workspace">
-            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS TIDP</h2><p>Compare only GLS shop drawings from MIDP-DRW-SWD. Filter = Column Z "Sub-Owner" exactly equal to GLS. Every populated column in the drawing row is compared.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
+            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS TIDP</h2><p>Compare drawing deliverables from MIDP-DRW-SWD. Baseline MIDP = Sub-Owner GLS; updated TIDP = no Sub-Owner filter.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
             <div className="drop-grid midp-upload-grid">
               <DropZone title="TAJ MIDP" subtitle="TAJ Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={tajMidpFiles} onFiles={(f) => setTajMidpFiles(f.slice(0,1))} color="#c77645" />
               <DropZone title="GLS TIDP" subtitle="Glassline Task Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
@@ -561,9 +594,9 @@ function App() {
             <button className="primary" disabled={!tajMidpFiles.length || !glsMidpFiles.length || midpLoading} onClick={runMidpComparison}>{midpLoading ? <><LoaderCircle className="spin"/>Comparing MIDPs…</> : <>Compare TAJ vs GLS <ArrowRight size={18}/></>}</button>
             <p className="helper"><Info size={13}/> The comparison is processed locally in your browser.</p>
           </section> : <section className="results midp-results">
-            <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS MIDP</h2><p>GLS shop-drawing register differences and status/code totals.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
+            <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS TIDP</h2><p>Drawing deliverable differences, revision/status changes, title changes, additions and removals.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
             <div className="gls-filter-note"><strong>Filter:</strong> {midpComparison.filterLabel} <span>•</span> Drawing rows are matched by Drawing Number; every populated column is checked for changes.</div>
-            <div className="midp-summary-columns"><MidpSummaryCard title="TAJ MIDP" summary={midpComparison.tajSummary} /><MidpSummaryCard title="GLS MIDP" summary={midpComparison.glsSummary} /></div>
+            <div className="midp-summary-columns"><MidpSummaryCard title="TAJ MIDP" summary={midpComparison.tajSummary} /><MidpSummaryCard title="GLS TIDP" summary={midpComparison.glsSummary} /></div>
             <div className="midp-change-grid"><div><small>Added in GLS</small><strong>{midpComparison.counts.added}</strong></div><div><small>Removed from GLS</small><strong>{midpComparison.counts.removed}</strong></div><div><small>Changed</small><strong>{midpComparison.counts.changed}</strong></div><div><small>Unchanged</small><strong>{midpComparison.counts.unchanged}</strong></div></div>
             <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>TAJ Status</span><span>GLS Status</span><span>Fields Changed</span><span>Result</span></div>
             <div className="checks">{midpComparison.rows.map((r) => <article className="check" key={r.key}>
@@ -574,7 +607,7 @@ function App() {
               {r.type === 'added' && <div className="midp-field-changes"><div className="midp-field-change"><strong>Entire row</strong><span>—</span><span>Added in GLS</span></div></div>}
               {r.type === 'removed' && <div className="midp-field-changes"><div className="midp-field-change"><strong>Entire row</strong><span>Removed from GLS</span><span>—</span></div></div>}
             </article>)}</div>
-            <div className="next-check"><div><span className="eyebrow">NEXT STEP</span><h3>MIDP vs Metadata vs PDF</h3><p>Continue with the existing drawing validation workflow using the GLS MIDP.</p></div><button className="primary" onClick={() => { setMidpFiles(glsMidpFiles); setMode('validator'); }}><ArrowRight size={18}/>Continue to drawing checker</button></div>
+            <div className="next-check"><div><span className="eyebrow">NEXT STEP</span><h3>MIDP vs Metadata vs PDF</h3><p>Continue with the existing drawing validation workflow using the GLS TIDP.</p></div><button className="primary" onClick={() => { setMidpFiles(glsMidpFiles); setMode('validator'); }}><ArrowRight size={18}/>Continue to drawing checker</button></div>
           </section>}
         </main>
         <footer><span>DrawingCheck <b>0.2</b></span><span>Designed for controlled BIM / Document Control review</span></footer>
