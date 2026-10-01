@@ -335,9 +335,10 @@ function parseMidpForComparison(workbook) {
     // IMPORTANT: Column Z / Sub-Owner is the only scope filter.
     if (!doc || !/^GLS$/i.test(subOwner)) return;
 
-    // Accept the project's actual drawing identifiers even if a future naming
-    // variation does not fully match DOC_PATTERN.
-    if (!/-DRW-/i.test(doc) && !DOC_PATTERN.test(doc)) return;
+    // DRAWING NUMBER is the authoritative identifier. Do not require a
+    // particular naming pattern such as -DRW- because the real MIDP may use
+    // different project-specific drawing number formats.
+    if (!doc) return;
 
     const values = {};
     rawHeaders.forEach((header, i) => {
