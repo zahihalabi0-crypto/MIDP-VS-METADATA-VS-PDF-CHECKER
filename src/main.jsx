@@ -331,8 +331,8 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
   const normalizedHeaders = rawHeaders.map((h) => clean(h).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim());
 
   // Prefer the actual column headed "Status" for Code B / Code C / UR checks.
-  const statusHeaderIndex = normalizedHeaders.findIndex((h) => h === 'status' || h === 'submission status' || h.includes('status'));
-  const statusIndex = statusHeaderIndex >= 0 ? statusHeaderIndex : suitabilityIndex;
+  // Status is fixed to Column K (11th Excel column) in the drawing register.
+  const statusIndex = 10; // K
 
   const records = [];
   const duplicateKeys = new Set();
@@ -709,17 +709,13 @@ function App() {
             <p className="helper"><Info size={13}/> The comparison is processed locally in your browser.</p>
           </section> : <section className="results midp-results">
             <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS TIDP</h2><p>Weekly implementation audit: TIDP colour marks requested ADD / REMOVE / MODIFY actions; the current TAJ MIDP is checked to confirm whether those requests were implemented.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
-            <div className="gls-filter-note"><strong>Filter:</strong> {midpComparison.filterLabel} <span>•</span> Drawing rows are matched by Drawing Number; every populated column is checked for changes.</div>
-            <div className="midp-summary-columns"><MidpSummaryCard title="TAJ MIDP" summary={midpComparison.tajSummary} /><MidpSummaryCard title="GLS TIDP" summary={midpComparison.glsSummary} /></div><div className="gls-filter-note"><strong>Weekly audit logic:</strong> Red = requested removal, Green = requested addition, Yellow = requested modification. Status is read from the column headed “Status” and checked for values such as UR, Code B and Code C. Drawing-title changes are also explicitly checked.</div>
-            <div className="midp-change-grid"><div><small>Added in GLS</small><strong>{midpComparison.counts.added}</strong></div><div><small>Removed from GLS</small><strong>{midpComparison.counts.removed}</strong></div><div><small>Changed</small><strong>{midpComparison.counts.changed}</strong></div><div><small>Unchanged</small><strong>{midpComparison.counts.unchanged}</strong></div></div>
+            <div className="gls-filter-note"><strong>Result:</strong> Drawing numbers are matched between GLS TIDP and TAJ MIDP. GLS colour = expected action; TAJ = actual implementation.</div>
             <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>TAJ Drawing Title</span><span>TIDP Drawing Title</span><span>TAJ Status</span><span>TIDP Status</span><span>Requested</span><span>Implementation</span></div>
             <div className="checks">{midpComparison.rows.map((r) => <article className="check" key={r.key}>
               <div className="midp-result-row"><strong>{r.key}</strong><span title={r.taj?.title || ''}>{r.taj?.title || '—'}</span><span title={r.gls?.title || ''}>{r.gls?.title || '—'}</span><span>{r.taj?.status || '—'}</span><span>{r.gls?.status || '—'}</span><span>{r.requestedAction || '—'}</span><span title={r.implementationStatus}>{r.implementationStatus}</span></div>
               {r.type === 'changed' && <div className="midp-field-changes">
                 {r.fieldChanges.map((c) => <div className="midp-field-change" key={c.field}><strong>{c.field}</strong><span title={c.taj || ''}>{c.taj || '—'}</span><span title={c.gls || ''}>{c.gls || '—'}</span></div>)}
               </div>}
-              {r.type === 'added' && <div className="midp-field-changes"><div className="midp-field-change"><strong>Entire row</strong><span>—</span><span>Added in GLS</span></div></div>}
-              {r.type === 'removed' && <div className="midp-field-changes"><div className="midp-field-change"><strong>Entire row</strong><span>Removed from GLS</span><span>—</span></div></div>}
             </article>)}</div>
             <div className="next-check"><div><span className="eyebrow">NEXT STEP</span><h3>MIDP vs Metadata vs PDF</h3><p>Continue with the existing drawing validation workflow using the GLS TIDP.</p></div><button className="primary" onClick={() => { setMidpFiles(glsMidpFiles); setMode('validator'); }}><ArrowRight size={18}/>Continue to drawing checker</button></div>
           </section>}
