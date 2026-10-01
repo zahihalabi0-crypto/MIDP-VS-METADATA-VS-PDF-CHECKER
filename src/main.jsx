@@ -254,57 +254,95 @@ function parseMidpForComparison(workbook) {
   const records = [];
   const targetSheet = workbook.SheetNames.find((name) => clean(name).toUpperCase() === 'MIDP-DRW-SWD');
   if (!targetSheet) {
-    throw new Error('The MIDP-DRW-SWD sheet was not found. Please upload the correct MIDP workbook.');
+    throw new Error(`MIDP-DRW-SWD was not found. Available sheets: ${workbook.SheetNames.join(', ')}`);
   }
 
   const rows = sheetRows(workbook, targetSheet);
+  const normalizeHeader = (v) => clean(v).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const isOwnerHeader = (v) => /^(sub owner|sub-owner)$/.test(normalizeHeader(v)) || normalizeHeader(v).includes('sub owner');
+  const isDrawingHeader = (v) => {
+    const h = normalizeHeader(v);
+    return [
+      'document no', 'document number', 'drawing no', 'drawing number',
+      'doc no', 'doc number', 'drawing id', 'document id'
+    ].includes(h) || ((h.includes('drawing') || h.includes('document')) && (h.includes('no') || h.includes('number')));
+  };
+
+  // Column Z is authoritative for Sub-Owner.
+  const ownerIndex = 25;
   let headerRow = -1;
 
-  // This comparison is intentionally limited to the Shop Drawing register.
-  // The project MIDP uses the "Sub-Owner" field in Excel column Z.
-  for (let r = 0; r < Math.min(rows.length, 60); r += 1) {
-    const headers = rows[r].map((v) => clean(v).toLowerCase());
-    const hasDoc = headers.some((h) => h === 'document no' || h === 'document number' || h.includes('document no'));
-    const hasOwner = headers.some((h) => h === 'sub-owner' || h.includes('sub-owner'));
-    if (hasDoc && hasOwner) {
+  // First preference: the row containing "Sub-Owner" in column Z.
+  for (let r = 0; r < Math.min(rows.length, 80); r += 1) {
+    if (isOwnerHeader(rows[r]?.[ownerIndex])) {
       headerRow = r;
       break;
     }
   }
 
+  // Fallback: find a row containing Sub-Owner anywhere.
   if (headerRow < 0) {
-    throw new Error('The MIDP-DRW-SWD sheet was found, but the header row with Document No and Sub-Owner could not be identified.');
+    for (let r = 0; r < Math.min(rows.length, 80); r += 1) {
+      if (rows[r].some(isOwnerHeader)) {
+        headerRow = r;
+        break;
+      }
+    }
   }
 
-  const rawHeaders = rows[headerRow].map((h, i) => clean(h) || \`Column \${i + 1}\`);
-  const docIndex = headerIndex(rawHeaders, ['document no', 'document number']);
-  const detectedOwnerIndex = headerIndex(rawHeaders, ['sub-owner']);
+  if (headerRow < 0) {
+    throw new Error(`MIDP-DRW-SWD was found, but a Sub-Owner header could not be identified. Column Z sample: ${rows.slice(0,10).map((r,i)=>`row ${i+1}: ${clean(r?.[ownerIndex])}`).join(' | ')}`);
+  }
 
-  // Column Z is index 25 in a zero-based JavaScript array.
-  const subOwnerIndex = 25;
-  const effectiveOwnerIndex = clean(rows[headerRow][subOwnerIndex])
-    ? subOwnerIndex
-    : detectedOwnerIndex;
+  const rawHeaders = rows[headerRow].map((h, i) => clean(h) || `Column ${i + 1}`);
+  let docIndex = rawHeaders.findIndex(isDrawingHeader);
 
-  if (docIndex < 0) throw new Error('Document No was not found in MIDP-DRW-SWD.');
-  if (effectiveOwnerIndex < 0) throw new Error('Sub-Owner was not found in MIDP-DRW-SWD column Z.');
+  // Fallback: detect the column containing the most real drawing numbers.
+  if (docIndex < 0) {
+    let bestIndex = -1;
+    let bestScore = 0;
+    const maxCol = Math.max(...rows.slice(headerRow + 1, headerRow + 61).map(r => r.length), rawHeaders.length);
+    for (let c = 0; c < maxCol; c += 1) {
+      let score = 0;
+      for (const row of rows.slice(headerRow + 1, headerRow + 61)) {
+        const value = clean(row[c]);
+        if (DOC_PATTERN.test(value) && /-DRW-/i.test(value)) score += 1;
+      }
+      if (score > bestScore) { bestScore = score; bestIndex = c; }
+    }
+    if (bestIndex >= 0) docIndex = bestIndex;
+  }
+
+  if (docIndex < 0) {
+    throw new Error(`MIDP-DRW-SWD was found and Sub-Owner was detected on row ${headerRow + 1}, but no drawing/document-number column could be identified. Headers: ${rawHeaders.filter(Boolean).join(' | ')}`);
+  }
 
   const titleIndex = headerIndex(rawHeaders, ['title', 'drawing title', 'document title', 'description']);
   const revisionIndex = headerIndex(rawHeaders, ['revision', 'rev']);
   const statusIndex = headerIndex(rawHeaders, ['status', 'submission status', 'document status']);
   const codeIndex = headerIndex(rawHeaders, ['code', 'status code', 'document code', 'code b/c', 'approval code']);
 
+  let glsRows = 0;
+  let drawingRows = 0;
+
   rows.slice(headerRow + 1).forEach((row, offset) => {
     const doc = clean(row[docIndex]);
-    const subOwner = clean(row[effectiveOwnerIndex]);
+    const subOwner = clean(row[ownerIndex]);
 
-    // IMPORTANT: do not search the whole row for "GLS".
-    // Only column Z / Sub-Owner controls the GLS scope.
-    if (!doc || !DOC_PATTERN.test(doc) || !/-DRW-/i.test(doc) || !/^GLS$/i.test(subOwner)) return;
+    if (/^GLS$/i.test(subOwner)) glsRows += 1;
+    if (doc && /-DRW-/i.test(doc)) drawingRows += 1;
+
+    // IMPORTANT: Column Z / Sub-Owner is the only scope filter.
+    if (!doc || !/^GLS$/i.test(subOwner)) return;
+
+    // Accept the project's actual drawing identifiers even if a future naming
+    // variation does not fully match DOC_PATTERN.
+    if (!/-DRW-/i.test(doc) && !DOC_PATTERN.test(doc)) return;
 
     const values = {};
     rawHeaders.forEach((header, i) => {
-      values[header] = clean(row[i]);
+      const value = clean(row[i]);
+      if (value) values[header] = value;
     });
 
     records.push({
@@ -318,12 +356,15 @@ function parseMidpForComparison(workbook) {
       code: codeIndex >= 0 ? clean(row[codeIndex]) : '',
       category: midpCategory(row, statusIndex, codeIndex),
       values,
-      headers: rawHeaders,
+      headers: Object.keys(values),
     });
   });
 
-  // The register can contain both CAD and PDF rows for the same drawing.
-  // Compare one logical drawing row, preferring the PDF record when available.
+  if (!records.length) {
+    throw new Error(`MIDP-DRW-SWD was read successfully, but no GLS drawing records were found. Header row: ${headerRow + 1}; drawing/document column: ${rawHeaders[docIndex] || `Column ${docIndex + 1}`}; GLS rows in Column Z: ${glsRows}; rows containing -DRW-: ${drawingRows}. The tool filters ONLY Column Z (Sub-Owner) = GLS.`);
+  }
+
+  // If both CAD and PDF rows exist for one drawing, keep the PDF row.
   const map = new Map();
   records.forEach((record) => {
     const existing = map.get(record.base);
@@ -332,7 +373,6 @@ function parseMidpForComparison(workbook) {
 
   return [...map.values()];
 }
-
 function compareMidpRecords(taj, gls) {
   const tajMap = new Map(taj.map((r) => [r.base, r]));
   const glsMap = new Map(gls.map((r) => [r.base, r]));
