@@ -229,28 +229,34 @@ const FIELD_LABELS = {
 
 
 function normalizeMidpField(value) {
-  return clean(value).toUpperCase().replace(/\s+/g, ' ').trim();
+  return clean(value).toUpperCase().replace(/\\s+/g, ' ').trim();
 }
+
 function midpCategory(row, statusIndex, codeIndex) {
   const candidates = [
     statusIndex >= 0 ? normalizeMidpField(row[statusIndex]) : '',
     codeIndex >= 0 ? normalizeMidpField(row[codeIndex]) : '',
   ];
   const combined = candidates.join(' ');
-  if (/\bNYS\b|NOT\s+YET\s+SUBMITTED/i.test(combined)) return 'NYS';
-  if (/\bUR\b|UNDER\s+REVIEW/i.test(combined)) return 'UR';
-  if (/\bCODE\s*D\b|\bD\b/.test(combined)) return 'Code D';
-  if (/\bCODE\s*C\b|\bC\b/.test(combined)) return 'Code C';
-  if (/\bCODE\s*B\b|\bB\b/.test(combined)) return 'Code B';
+  if (/\\bNYS\\b|NOT\\s+YET\\s+SUBMITTED/i.test(combined)) return 'NYS';
+  if (/\\bUR\\b|UNDER\\s+REVIEW/i.test(combined)) return 'UR';
+  if (/\\bCODE\\s*D\\b|^D$/i.test(combined)) return 'Code D';
+  if (/\\bCODE\\s*C\\b|^C$/i.test(combined)) return 'Code C';
+  if (/\\bCODE\\s*B\\b|^B$/i.test(combined)) return 'Code B';
   return candidates.find(Boolean) || '';
 }
+
+function normalizeCompareValue(value) {
+  return clean(value).replace(/\\s+/g, ' ').trim().toUpperCase();
+}
+
 function parseMidpForComparison(workbook) {
   const records = [];
   const statusAliases = ['status', 'status code', 'submission status', 'document status', 'status/code'];
   const codeAliases = ['code', 'status code', 'document code', 'code b/c', 'approval code'];
-  const docAliases = ['document no', 'document number', 'drawing number', 'drawing no', 'document name', 'document id'];
+  const docAliases = ['document no', 'document number', 'drawing number', 'drawing no', 'document name', 'document id', 'drawing ref', 'drawing reference'];
   const revAliases = ['revision', 'rev', 'document revision'];
-  const titleAliases = ['title', 'drawing title', 'document title', 'description'];
+
   for (const name of workbook.SheetNames) {
     const rows = sheetRows(workbook, name);
     let headerRow = -1, indexes = null;
@@ -260,50 +266,82 @@ function parseMidpForComparison(workbook) {
       if (doc >= 0) {
         headerRow = r;
         indexes = {
-          doc, status: headerIndex(headers, statusAliases), code: headerIndex(headers, codeAliases),
-          rev: headerIndex(headers, revAliases), title: headerIndex(headers, titleAliases)
+          doc,
+          status: headerIndex(headers, statusAliases),
+          code: headerIndex(headers, codeAliases),
+          rev: headerIndex(headers, revAliases),
         };
         break;
       }
     }
     if (headerRow < 0 || !indexes) continue;
+
+    const rawHeaders = rows[headerRow].map((h, i) => clean(h) || `Column ${i + 1}`);
     rows.slice(headerRow + 1).forEach((row, offset) => {
       const doc = clean(row[indexes.doc]);
       if (!doc || !DOC_PATTERN.test(doc) || !/-DRW-/i.test(doc) || /-(PDF|CAD)$/i.test(doc)) return;
+
+      const values = {};
+      rawHeaders.forEach((header, i) => {
+        values[header] = clean(row[i]);
+      });
+
       records.push({
-        sourceRow: headerRow + offset + 2, sheet: name, doc, base: baseNumber(doc),
-        title: indexes.title >= 0 ? clean(row[indexes.title]) : '',
+        sourceRow: headerRow + offset + 2,
+        sheet: name,
+        doc,
+        base: baseNumber(doc),
+        title: clean(values[rawHeaders.find((h, i) => i === headerIndex(rawHeaders, ['title', 'drawing title', 'document title', 'description']))] || ''),
         revision: indexes.rev >= 0 ? revision(row[indexes.rev]) : '',
         status: indexes.status >= 0 ? clean(row[indexes.status]) : '',
         code: indexes.code >= 0 ? clean(row[indexes.code]) : '',
         category: midpCategory(row, indexes.status, indexes.code),
+        values,
+        headers: rawHeaders,
       });
     });
   }
+
   const map = new Map();
   records.forEach((record) => map.set(record.base, record));
   return [...map.values()];
 }
+
 function compareMidpRecords(taj, gls) {
   const tajMap = new Map(taj.map((r) => [r.base, r]));
   const glsMap = new Map(gls.map((r) => [r.base, r]));
   const keys = [...new Set([...tajMap.keys(), ...glsMap.keys()])].sort();
+
   return keys.map((key) => {
     const a = tajMap.get(key), b = glsMap.get(key);
-    if (!a) return { key, type: 'added', taj: null, gls: b, changes: ['Added in GLS'] };
-    if (!b) return { key, type: 'removed', taj: a, gls: null, changes: ['Removed from GLS'] };
-    const changes = [];
-    if (normalizeMidpField(a.category) !== normalizeMidpField(b.category)) changes.push('Status / code');
-    if (revision(a.revision) !== revision(b.revision)) changes.push('Revision');
-    if (normalizedTitle(a.title) !== normalizedTitle(b.title)) changes.push('Title');
-    return { key, type: changes.length ? 'changed' : 'unchanged', taj: a, gls: b, changes };
+    if (!a) return { key, type: 'added', taj: null, gls: b, changes: ['Entire drawing row added in GLS'], fieldChanges: [] };
+    if (!b) return { key, type: 'removed', taj: a, gls: null, changes: ['Entire drawing row removed from GLS'], fieldChanges: [] };
+
+    const headers = [...new Set([...(a.headers || []), ...(b.headers || [])])];
+    const fieldChanges = headers.map((field) => {
+      const av = a.values?.[field] ?? '';
+      const bv = b.values?.[field] ?? '';
+      return { field, taj: av, gls: bv };
+    }).filter((x) => normalizeCompareValue(x.taj) !== normalizeCompareValue(x.gls));
+
+    const changes = fieldChanges.map((x) => x.field);
+    return {
+      key,
+      type: fieldChanges.length ? 'changed' : 'unchanged',
+      taj: a,
+      gls: b,
+      changes,
+      fieldChanges,
+    };
   });
 }
+
 function midpSummary(records) {
   const summary = { total: records.length, UR: 0, 'Code B': 0, 'Code C': 0, 'Code D': 0, NYS: 0, Other: 0 };
   records.forEach((r) => { if (summary[r.category] != null) summary[r.category] += 1; else summary.Other += 1; });
   return summary;
 }
+
 function MidpSummaryCard({ title, summary }) {
   const items = [['Total Drawings', summary.total], ['UR', summary.UR], ['Code B', summary['Code B']], ['Code C', summary['Code C']], ['Code D', summary['Code D']], ['NYS', summary.NYS]];
   return <div className="midp-summary-card"><h3>{title}</h3><div className="midp-count-grid">{items.map(([label, value]) => <div key={label}><small>{label}</small><strong>{value}</strong></div>)}</div></div>;
@@ -388,15 +426,41 @@ function App() {
   }
   function downloadMidpReport() {
     if (!midpComparison) return;
-    const data = midpComparison.rows.map((r) => ({
-      'Drawing Number': r.key, 'Comparison Result': r.type,
-      'TAJ Status/Code': r.taj?.category || '', 'GLS Status/Code': r.gls?.category || '',
-      'TAJ Revision': r.taj?.revision || '', 'GLS Revision': r.gls?.revision || '',
-      'TAJ Title': r.taj?.title || '', 'GLS Title': r.gls?.title || '', Changes: r.changes.join(', ')
-    }));
+    const data = midpComparison.rows.flatMap((r) => {
+      if (r.type === 'added' || r.type === 'removed') {
+        const record = r.type === 'added' ? r.gls : r.taj;
+        return [{
+          'Drawing Number': r.key,
+          'Comparison Result': r.type.toUpperCase(),
+          'Changed Field': 'Entire row',
+          'TAJ Value': r.taj ? Object.values(r.taj.values || {}).join(' | ') : '',
+          'GLS Value': r.gls ? Object.values(r.gls.values || {}).join(' | ') : '',
+          'Source Sheet / Row': record ? `${record.sheet} / ${record.sourceRow}` : '',
+        }];
+      }
+      if (r.type === 'unchanged') {
+        return [{
+          'Drawing Number': r.key,
+          'Comparison Result': 'UNCHANGED',
+          'Changed Field': '',
+          'TAJ Value': '',
+          'GLS Value': '',
+          'Source Sheet / Row': `${r.taj.sheet} / ${r.taj.sourceRow}`,
+        }];
+      }
+      return r.fieldChanges.map((c) => ({
+        'Drawing Number': r.key,
+        'Comparison Result': 'CHANGED',
+        'Changed Field': c.field,
+        'TAJ Value': c.taj,
+        'GLS Value': c.gls,
+        'Source Sheet / Row': `${r.taj.sheet} / ${r.taj.sourceRow} → ${r.gls.sheet} / ${r.gls.sourceRow}`,
+      }));
+    });
     const ws = XLSX.utils.json_to_sheet(data);
-    ws['!cols'] = [{wch:50},{wch:20},{wch:18},{wch:18},{wch:14},{wch:14},{wch:55},{wch:55},{wch:30}];
-    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'TAJ vs GLS');
+    ws['!cols'] = [{wch:50},{wch:18},{wch:35},{wch:65},{wch:65},{wch:45}];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'TAJ vs GLS');
     XLSX.writeFile(wb, 'TAJ_vs_GLS_MIDP_' + new Date().toISOString().slice(0,10) + '.xlsx');
   }
 
@@ -446,8 +510,15 @@ function App() {
             <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS MIDP</h2><p>Drawing register differences and status/code totals.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
             <div className="midp-summary-columns"><MidpSummaryCard title="TAJ MIDP" summary={midpComparison.tajSummary} /><MidpSummaryCard title="GLS MIDP" summary={midpComparison.glsSummary} /></div>
             <div className="midp-change-grid"><div><small>Added in GLS</small><strong>{midpComparison.counts.added}</strong></div><div><small>Removed from GLS</small><strong>{midpComparison.counts.removed}</strong></div><div><small>Changed</small><strong>{midpComparison.counts.changed}</strong></div><div><small>Unchanged</small><strong>{midpComparison.counts.unchanged}</strong></div></div>
-            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>TAJ</span><span>GLS</span><span>Changes</span><span>Result</span></div>
-            <div className="checks">{midpComparison.rows.map((r) => <article className="check" key={r.key}><div className="midp-result-row"><strong>{r.key}</strong><span>{r.taj?.category || '—'}</span><span>{r.gls?.category || '—'}</span><span>{r.changes.join(', ') || 'No changes'}</span><StatusBadge status={r.type === 'unchanged' ? 'pass' : r.type === 'changed' ? 'warning' : 'fail'} count={r.type} /></div></article>)}</div>
+            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>TAJ Status</span><span>GLS Status</span><span>Fields Changed</span><span>Result</span></div>
+            <div className="checks">{midpComparison.rows.map((r) => <article className="check" key={r.key}>
+              <div className="midp-result-row"><strong>{r.key}</strong><span>{r.taj?.category || '—'}</span><span>{r.gls?.category || '—'}</span><span>{r.type === 'changed' ? `${r.fieldChanges.length} field change${r.fieldChanges.length !== 1 ? 's' : ''}` : r.changes.join(', ')}</span><StatusBadge status={r.type === 'unchanged' ? 'pass' : r.type === 'changed' ? 'warning' : 'fail'} count={r.type} /></div>
+              {r.type === 'changed' && <div className="midp-field-changes">
+                {r.fieldChanges.map((c) => <div className="midp-field-change" key={c.field}><strong>{c.field}</strong><span title={c.taj || ''}>{c.taj || '—'}</span><span title={c.gls || ''}>{c.gls || '—'}</span></div>)}
+              </div>}
+              {r.type === 'added' && <div className="midp-field-changes"><div className="midp-field-change"><strong>Entire row</strong><span>—</span><span>Added in GLS</span></div></div>}
+              {r.type === 'removed' && <div className="midp-field-changes"><div className="midp-field-change"><strong>Entire row</strong><span>Removed from GLS</span><span>—</span></div></div>}
+            </article>)}</div>
             <div className="next-check"><div><span className="eyebrow">NEXT STEP</span><h3>MIDP vs Metadata vs PDF</h3><p>Continue with the existing drawing validation workflow using the GLS MIDP.</p></div><button className="primary" onClick={() => { setMidpFiles(glsMidpFiles); setMode('validator'); }}><ArrowRight size={18}/>Continue to drawing checker</button></div>
           </section>}
         </main>
