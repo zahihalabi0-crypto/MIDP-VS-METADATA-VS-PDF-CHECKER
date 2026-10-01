@@ -109,32 +109,37 @@ function normalizeMetadataDescription(value) {
   return clean(value).toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
 }
 
-function parseMetadataComparison(workbook) {
-  const records = [];
-  for (const name of workbook.SheetNames) {
-    const rows = sheetRows(workbook, name);
-    const h = findHeader(rows, ['document no', 'document number']);
-    if (h < 0) continue;
-    const headers = rows[h];
-    const idx = {
-      doc: headerIndex(headers, ['document no', 'document number']),
-      description: headerIndex(headers, ['drawing description', 'description', 'drawing title', 'title']),
-      status: headerIndex(headers, ['status']),
-    };
-    if (idx.doc < 0) continue;
-    rows.slice(h + 1).forEach((row, offset) => {
-      const doc = clean(row[idx.doc]);
-      if (!DOC_PATTERN.test(doc)) return;
-      records.push({
-        sourceRow: h + offset + 2,
-        sheet: name,
-        doc,
-        base: baseNumber(doc),
-        description: idx.description >= 0 ? clean(row[idx.description]) : '',
-        status: idx.status >= 0 ? clean(row[idx.status]) : '',
-      });
-    });
+function parseMetadataComparison(workbook, { filterGLS = false } = {}) {
+  const sheetName = 'MIDP-DRW-SWD';
+  if (!workbook.SheetNames.includes(sheetName)) {
+    throw new Error(`The required sheet "${sheetName}" was not found.`);
   }
+
+  const rows = sheetRows(workbook, sheetName);
+  const headerRow = 3; // Excel row 4
+  const headers = rows[headerRow] || [];
+  const docIndex = 5; // F = Drawing Number
+  const titleIndex = 6; // G = Drawing Description / Title
+  const statusIndex = 10; // K = Status
+  const ownerIndex = 25; // Z = Sub-Owner
+
+  const records = [];
+  rows.slice(headerRow + 1).forEach((row, offset) => {
+    const doc = clean(row[docIndex]);
+    if (!doc || !DOC_PATTERN.test(doc)) return;
+
+    if (filterGLS && clean(row[ownerIndex]).toUpperCase() !== 'GLS') return;
+
+    records.push({
+      sourceRow: headerRow + offset + 2,
+      sheet: sheetName,
+      doc,
+      base: baseNumber(doc),
+      description: clean(row[titleIndex]),
+      status: clean(row[statusIndex]),
+      subOwner: clean(row[ownerIndex]),
+    });
+  });
 
   const map = new Map();
   const duplicates = [];
@@ -147,8 +152,9 @@ function parseMetadataComparison(workbook) {
   });
 
   if (!map.size) {
-    throw new Error('No metadata drawing records were found. Check that both files contain a Document Number column.');
+    throw new Error(`No drawing records were found in "${sheetName}".`);
   }
+
   return { records: [...map.values()], duplicates };
 }
 
@@ -160,10 +166,10 @@ function compareMetadataVersions(gls, taj) {
     const glsRecord = glsMap.get(key);
     const tajRecord = tajMap.get(key);
     const existsInTaj = Boolean(tajRecord);
-    const descriptionMatch = existsInTaj
-      && normalizeMetadataDescription(glsRecord.description) === normalizeMetadataDescription(tajRecord.description);
-    const statusMatch = existsInTaj
-      && normalizeCompareValue(glsRecord.status) === normalizeCompareValue(tajRecord.status);
+    const descriptionMatch = existsInTaj &&
+      normalizeMetadataDescription(glsRecord.description) === normalizeMetadataDescription(tajRecord.description);
+    const statusMatch = existsInTaj &&
+      normalizeCompareValue(glsRecord.status) === normalizeCompareValue(tajRecord.status);
 
     return {
       key,
@@ -178,11 +184,15 @@ function compareMetadataVersions(gls, taj) {
   });
 
   const statusTotals = {};
-  [...gls.records, ...taj.records].forEach((record) => {
+  gls.records.forEach((record) => {
     const status = clean(record.status) || 'Blank';
     if (!statusTotals[status]) statusTotals[status] = { gls: 0, taj: 0 };
-    if (glsMap.has(record.base)) statusTotals[status].gls += 1;
-    if (tajMap.has(record.base)) statusTotals[status].taj += 1;
+    statusTotals[status].gls += 1;
+  });
+  taj.records.forEach((record) => {
+    const status = clean(record.status) || 'Blank';
+    if (!statusTotals[status]) statusTotals[status] = { gls: 0, taj: 0 };
+    statusTotals[status].taj += 1;
   });
 
   return {
@@ -655,24 +665,24 @@ function MidpSummaryCard({ title, summary }) {
   return <div className="midp-summary-card"><h3>{title}</h3><div className="midp-count-grid">{items.map(([label, value]) => <div key={label}><small>{label}</small><strong>{value}</strong></div>)}</div></div>;
 }
 
-function createChecks(midpRecords, metadataRecords, pdfRecords) {
+function createChecks(midpRecords, TIDP/MIDPRecords, pdfRecords) {
   // A check session is defined by the drawing PDFs the user selected. The MIDP
-  // and metadata may contain thousands of unrelated historical records.
+  // and TIDP/MIDP may contain thousands of unrelated historical records.
   const keys = [...new Set(pdfRecords.map((r) => r.base).filter(Boolean))];
   return keys.map((key) => {
     const midp = midpRecords.find((r) => r.base === key);
-    const metadata = metadataRecords.find((r) => r.base === key && /-PDF$/i.test(r.doc))
-      || metadataRecords.find((r) => r.base === key);
+    const TIDP/MIDP = TIDP/MIDPRecords.find((r) => r.base === key && /-PDF$/i.test(r.doc))
+      || TIDP/MIDPRecords.find((r) => r.base === key);
     const pdf = pdfRecords.find((r) => r.base === key);
     const rows = ['doc', 'revision', 'title', 'issueDate', 'modelRef'].map((field) => {
       const m = field === 'doc' ? midp?.base : midp?.[field];
-      const d = field === 'doc' ? metadata?.base : metadata?.[field];
+      const d = field === 'doc' ? TIDP/MIDP?.base : TIDP/MIDP?.[field];
       const p = field === 'doc' ? pdf?.base : pdf?.[field];
-      return { field, label: FIELD_LABELS[field], midp: m || '', metadata: d || '', pdf: p || '', ...compareValue(field, m, d, p) };
+      return { field, label: FIELD_LABELS[field], midp: m || '', TIDP/MIDP: d || '', pdf: p || '', ...compareValue(field, m, d, p) };
     });
     const fail = rows.filter((r) => r.status === 'fail').length;
     const warning = rows.filter((r) => ['warning', 'missing'].includes(r.status)).length;
-    return { key, midp, metadata, pdf, rows, fail, warning, status: fail ? 'fail' : warning ? 'warning' : 'pass' };
+    return { key, midp, TIDP/MIDP, pdf, rows, fail, warning, status: fail ? 'fail' : warning ? 'warning' : 'pass' };
   }).sort((a, b) => (a.status === 'fail' ? -1 : 1) - (b.status === 'fail' ? -1 : 1));
 }
 
@@ -705,13 +715,13 @@ function App() {
   const [midpLoading, setMidpLoading] = useState(false);
   const [midpError, setMidpError] = useState('');
   const [midpFiles, setMidpFiles] = useState([]);
-  const [metadataFiles, setMetadataFiles] = useState([]);
+  const [TIDP/MIDPFiles, setMetadataFiles] = useState([]);
   const [pdfFiles, setPdfFiles] = useState([]);
   const [checks, setChecks] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [open, setOpen] = useState({});
-  const ready = midpFiles.length && metadataFiles.length && pdfFiles.length;
+  const ready = midpFiles.length && TIDP/MIDPFiles.length && pdfFiles.length;
   const totals = useMemo(() => ({
     drawings: checks.length,
     pass: checks.reduce((n, c) => n + c.rows.filter((r) => r.status === 'pass').length, 0),
@@ -722,20 +732,22 @@ function App() {
   async function runMidpComparison() {
     setMidpLoading(true); setMidpError(''); setMidpComparison(null);
     try {
-      const [glsBook, tajBook] = await Promise.all([
+      const [tidpBook, midpBook] = await Promise.all([
         readWorkbook(glsMidpFiles[0]),
         readWorkbook(tajMidpFiles[0]),
       ]);
-      const gls = parseMetadataComparison(glsBook);
-      const taj = parseMetadataComparison(tajBook);
-      const comparison = compareMetadataVersions(gls, taj);
-      setMidpComparison({ ...comparison, glsDuplicates: gls.duplicates, tajDuplicates: taj.duplicates });
+      // TIDP = GLS file (no Sub-Owner filter). MIDP = TAJ file (only GLS rows from Sub-Owner column Z).
+      const tidp = parseMetadataComparison(tidpBook, { filterGLS: false });
+      const midp = parseMetadataComparison(midpBook, { filterGLS: true });
+      const comparison = compareMetadataVersions(tidp, midp);
+      setMidpComparison({ ...comparison, glsDuplicates: tidp.duplicates, tajDuplicates: midp.duplicates });
     } catch (e) {
-      setMidpError(e.message || 'The GLS and TAJ metadata files could not be compared.');
+      setMidpError(e.message || 'The GLS TIDP and TAJ MIDP files could not be compared.');
     } finally {
       setMidpLoading(false);
     }
   }
+
 
   function downloadMidpReport() {
     if (!midpComparison) return;
@@ -781,13 +793,13 @@ function App() {
   async function runCheck() {
     setLoading(true); setError('');
     try {
-      const [midpBook, metadataBook] = await Promise.all([readWorkbook(midpFiles[0]), readWorkbook(metadataFiles[0])]);
-      const [midp, metadata, pdfs] = await Promise.all([
-        Promise.resolve(parseMidp(midpBook)), Promise.resolve(parseMetadata(metadataBook)),
+      const [midpBook, TIDP/MIDPBook] = await Promise.all([readWorkbook(midpFiles[0]), readWorkbook(TIDP/MIDPFiles[0])]);
+      const [midp, TIDP/MIDP, pdfs] = await Promise.all([
+        Promise.resolve(parseMidp(midpBook)), Promise.resolve(parseMetadata(TIDP/MIDPBook)),
         Promise.all(pdfFiles.map(parsePdf)),
       ]);
-      const output = createChecks(midp, metadata, pdfs);
-      if (!output.length) throw new Error('No drawing numbers could be matched. Check that these files use the expected MIDP and metadata formats.');
+      const output = createChecks(midp, TIDP/MIDP, pdfs);
+      if (!output.length) throw new Error('No drawing numbers could be matched. Check that these files use the expected MIDP and TIDP/MIDP formats.');
       setChecks(output); setOpen(Object.fromEntries(output.map((c) => [c.key, true])));
     } catch (e) { setError(e.message || 'The files could not be processed.'); }
     finally { setLoading(false); }
@@ -797,7 +809,7 @@ function App() {
 
   function downloadReport() {
     const data = checks.flatMap((c) => c.rows.map((r) => ({
-      'Drawing Number': c.key, Field: r.label, MIDP: r.midp, Metadata: r.metadata,
+      'Drawing Number': c.key, Field: r.label, MIDP: r.midp, Metadata: r.TIDP/MIDP,
       'PDF Title Block': r.pdf, Result: r.status.toUpperCase(), Note: r.note,
     })));
     const ws = XLSX.utils.json_to_sheet(data);
@@ -809,19 +821,19 @@ function App() {
   if (mode === 'midp') {
     return (
       <div className="app">
-        <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>Metadata comparison</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
+        <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>TIDP vs MIDP comparison</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
         <main>
           {!midpComparison ? <section className="workspace">
-            <div className="section-title"><div><span>01</span><div><h2>GLS Metadata vs TAJ Metadata</h2><p>Compare GLS drawing descriptions and status against the TAJ metadata.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
+            <div className="section-title"><div><span>01</span><div><h2>GLS TIDP vs TAJ MIDP</h2><p>Compare GLS drawing descriptions and status against the TAJ TIDP/MIDP.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
             <div className="drop-grid midp-upload-grid">
-              <DropZone title="GLS Metadata" subtitle="Glassline metadata export" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
-              <DropZone title="TAJ Metadata" subtitle="TAJ metadata export" icon={FileSpreadsheet} accept=".xlsx,.xls" files={tajMidpFiles} onFiles={(f) => setTajMidpFiles(f.slice(0,1))} color="#c77645" />
+              <DropZone title="GLS TIDP" subtitle="Glassline TIDP/MIDP export" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
+              <DropZone title="TAJ MIDP" subtitle="TAJ MIDP" icon={FileSpreadsheet} accept=".xlsx,.xls" files={tajMidpFiles} onFiles={(f) => setTajMidpFiles(f.slice(0,1))} color="#c77645" />
             </div>
             {midpError && <div className="error"><XCircle size={18}/>{midpError}</div>}
-            <button className="primary" disabled={!glsMidpFiles.length || !tajMidpFiles.length || midpLoading} onClick={runMidpComparison}>{midpLoading ? <><LoaderCircle className="spin"/>Comparing metadata…</> : <>Compare GLS vs TAJ <ArrowRight size={18}/></>}</button>
+            <button className="primary" disabled={!glsMidpFiles.length || !tajMidpFiles.length || midpLoading} onClick={runMidpComparison}>{midpLoading ? <><LoaderCircle className="spin"/>Comparing TIDP/MIDP…</> : <>Compare GLS vs TAJ <ArrowRight size={18}/></>}</button>
             <p className="helper"><Info size={13}/> The comparison is processed locally in your browser.</p>
           </section> : <section className="results midp-results">
-            <div className="results-top"><div><span className="eyebrow">METADATA COMPARISON COMPLETE</span><h2>GLS Metadata vs TAJ Metadata</h2><p>Each GLS drawing is checked to see whether it exists in TAJ, whether the drawing description matches, and whether the status matches.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
+            <div className="results-top"><div><span className="eyebrow">METADATA COMPARISON COMPLETE</span><h2>GLS TIDP vs TAJ MIDP</h2><p>Each GLS drawing is checked to see whether it exists in TAJ, whether the drawing description matches, and whether the status matches.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
 
             <div className="midp-change-grid">
               <div><small>GLS Total</small><strong>{midpComparison.summary.glsTotal}</strong></div>
@@ -843,9 +855,9 @@ function App() {
               </div>
             </div>
 
-            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>GLS Metadata</span><span>TAJ Metadata</span><span>In TAJ</span><span>Description</span><span>Status</span><span>Overall</span></div>
+            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>GLS TIDP</span><span>TAJ MIDP</span><span>In TAJ</span><span>Description</span><span>Status</span><span>Overall</span></div>
             <div className="checks">{midpComparison.rows.map((r) => <article className="check" key={r.key}>
-              <div className="midp-result-row metadata-compare-row">
+              <div className="midp-result-row TIDP/MIDP-compare-row">
                 <strong>{r.key}</strong>
                 <span title={r.gls?.description || ''}>{r.gls?.description || '—'}</span>
                 <span title={r.taj?.description || ''}>{r.taj?.description || '—'}</span>
@@ -876,10 +888,10 @@ function App() {
       <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>BIM document validation</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
       <main>
         {!checks.length ? <section className="workspace">
-          <div className="section-title"><div><span>02</span><div><h2>MIDP vs Metadata vs PDF</h2><p>Validate the GLS MIDP against metadata and issued drawing PDFs.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
+          <div className="section-title"><div><span>02</span><div><h2>MIDP vs Metadata vs PDF</h2><p>Validate the GLS MIDP against TIDP/MIDP and issued drawing PDFs.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
           <div className="drop-grid">
             <DropZone title="MIDP workbook" subtitle="Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={midpFiles} onFiles={(f) => setMidpFiles(f.slice(0,1))} color="#c77645" />
-            <DropZone title="Metadata export" subtitle="Document Control data" icon={FileSpreadsheet} accept=".xlsx,.xls" files={metadataFiles} onFiles={(f) => setMetadataFiles(f.slice(0,1))} color="#507e79" />
+            <DropZone title="Metadata export" subtitle="Document Control data" icon={FileSpreadsheet} accept=".xlsx,.xls" files={TIDP/MIDPFiles} onFiles={(f) => setMetadataFiles(f.slice(0,1))} color="#507e79" />
             <DropZone title="Drawing PDFs" subtitle="Issued title blocks" icon={FileText} accept=".pdf" multiple files={pdfFiles} onFiles={setPdfFiles} color="#8b7961" />
           </div>
           {error && <div className="error"><XCircle size={18}/>{error}</div>}
@@ -891,7 +903,7 @@ function App() {
           <div className="comparison-head"><span>Drawing / field</span><span>MIDP</span><span>Metadata</span><span>PDF title block</span><span>Result</span></div>
           <div className="checks">{checks.map((c) => <article className="check" key={c.key}>
             <button className="check-title" onClick={() => setOpen((o) => ({...o, [c.key]: !o[c.key]}))}><div><ChevronDown className={open[c.key] ? 'rotated' : ''} size={18}/><span>{c.key}</span></div><StatusBadge status={c.status} count={c.fail ? `${c.fail} mismatch${c.fail > 1 ? 'es' : ''}` : c.warning ? `${c.warning} warning${c.warning > 1 ? 's' : ''}` : 'All matched'} /></button>
-            {open[c.key] && <div className="check-rows">{c.rows.map((r) => <div className="check-row" key={r.field}><strong>{r.label}</strong><span title={r.midp}>{r.field === 'issueDate' ? formatDate(r.midp) : r.midp || '—'}</span><span title={r.metadata}>{r.field === 'issueDate' ? formatDate(r.metadata) : r.metadata || '—'}</span><span title={r.pdf}>{r.field === 'issueDate' ? formatDate(r.pdf) : r.pdf || '—'}</span><StatusBadge status={r.status}/></div>)}</div>}
+            {open[c.key] && <div className="check-rows">{c.rows.map((r) => <div className="check-row" key={r.field}><strong>{r.label}</strong><span title={r.midp}>{r.field === 'issueDate' ? formatDate(r.midp) : r.midp || '—'}</span><span title={r.TIDP/MIDP}>{r.field === 'issueDate' ? formatDate(r.TIDP/MIDP) : r.TIDP/MIDP || '—'}</span><span title={r.pdf}>{r.field === 'issueDate' ? formatDate(r.pdf) : r.pdf || '—'}</span><StatusBadge status={r.status}/></div>)}</div>}
           </article>)}</div>
         </section>}
       </main>
