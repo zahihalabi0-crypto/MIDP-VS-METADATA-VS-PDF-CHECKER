@@ -274,13 +274,12 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
   const ownerIndex = 25; // Column Z
   let headerRow = -1;
 
-  // Find the actual register header. For TAJ MIDP, require both
-  // DRAWING NUMBER and the Column Z "Sub Owner" header on the same row.
-  // The GLS TIDP only needs DRAWING NUMBER.
+  // Identify the register header from DRAWING NUMBER only.
+  // Column Z is a fixed data-column filter for TAJ MIDP; it does not need
+  // to contain the "Sub Owner" label on the same physical Excel row.
+  // GLS TIDP is not filtered by Column Z.
   for (let r = 0; r < Math.min(rows.length, 150); r += 1) {
-    const hasDrawingHeader = rows[r].some(isDrawingHeader);
-    const hasOwnerHeader = clean(rows[r][ownerIndex]).toLowerCase().includes('sub owner');
-    if (hasDrawingHeader && (!filterGLS || hasOwnerHeader)) {
+    if (rows[r].some(isDrawingHeader)) {
       headerRow = r;
       break;
     }
@@ -308,7 +307,7 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
     const doc = clean(row[docIndex]);
     const subOwner = clean(row[ownerIndex]);
 
-    if (filterGLS && clean(subOwner).replace(/\\s+/g, ' ').trim().toUpperCase() !== 'GLS') return;
+    if (filterGLS && clean(subOwner).replace(/\s+/g, ' ').trim().toUpperCase() !== 'GLS') return;
     if (!doc) return;
 
     scopedRows += 1;
