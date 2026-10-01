@@ -71,3 +71,11 @@ footer { min-height:52px; border-top:1px solid #d8d2c7; padding:0 max(5vw,28px);
 
 .implementation-yes{font-weight:700!important;color:#2f816d!important}
 .implementation-no{font-weight:700!important;color:#b55249!important}
+
+.status-audit-table{margin:0 0 22px;background:#faf9f5;border:1px solid #dcd8cf;border-radius:10px;overflow:hidden}
+.status-audit-head,.status-audit-row{display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px;align-items:center}
+.status-audit-head{padding:11px 18px;background:#f0eee8;color:#77827f;font-size:10px;text-transform:uppercase;letter-spacing:1px}
+.status-audit-row{padding:11px 18px;border-top:1px solid #e5e1d9}
+.status-audit-row strong,.status-audit-row span{font-size:11px;color:#354744}
+.status-audit-row span{text-align:center;font-weight:600}
+@media(max-width:600px){.status-audit-head,.status-audit-row{grid-template-columns:1.5fr 1fr 1fr}}
