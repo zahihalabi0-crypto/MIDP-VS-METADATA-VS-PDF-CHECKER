@@ -278,7 +278,9 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
       h === 'document no' || h.includes('drawing number') || h.includes('document number');
   };
 
-  const ownerIndex = 25; // Column Z
+  // TAJ MIDP: detect the Sub Owner column from its header instead of assuming Z.
+  // Rows are included when that field contains "GLS" anywhere.
+  let ownerIndex = -1;
   let headerRow = -1;
 
   // Identify the register header from DRAWING NUMBER only.
@@ -290,6 +292,9 @@ function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
       headerRow = r;
       break;
     }
+  }
+  if (filterGLS && headerRow >= 0) {
+    ownerIndex = rows[headerRow].findIndex((value) => isOwnerHeader(value));
   }
   if (headerRow < 0) {
     throw new Error(`${targetSheet} was found, but the drawing register header row could not be identified.`);
