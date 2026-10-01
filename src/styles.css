@@ -48,7 +48,7 @@ footer { min-height:52px; border-top:1px solid #d8d2c7; padding:0 max(5vw,28px);
 .midp-change-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
 .midp-change-grid>div{background:#faf9f5;border:1px solid #dcd8cf;border-radius:10px;padding:14px 18px}
 .midp-change-grid strong{display:block;margin-top:4px;color:#2c4643;font:600 24px Manrope}
-.midp-result-row{display:grid;grid-template-columns:1.15fr 1.7fr 1.7fr .7fr .7fr .8fr 1.45fr;gap:12px;align-items:center;padding:14px 18px}
+.midp-result-row{display:grid;grid-template-columns:1.15fr .95fr 1.65fr 1.65fr .85fr .85fr 1fr;gap:12px;align-items:center;padding:14px 18px}
 .midp-result-row strong,.midp-result-row span{font-size:11px;color:#354744;overflow:hidden;text-overflow:ellipsis;line-height:1.4}
 .next-check{margin-top:28px;padding:20px 22px;background:#e9f0ed;border:1px solid #cadbd5;border-radius:12px;display:flex;align-items:center;justify-content:space-between;gap:20px}
 .next-check h3{margin:4px 0;color:#183b39;font:600 18px Manrope}
@@ -68,3 +68,6 @@ footer { min-height:52px; border-top:1px solid #d8d2c7; padding:0 max(5vw,28px);
 .gls-filter-note{margin:0 0 18px;padding:12px 15px;border:1px solid #dcd8cf;border-radius:9px;background:#faf9f5;color:#596966;font-size:11px}
 .gls-filter-note strong{color:#2c4643}
 .gls-filter-note span{margin:0 8px;color:#a29d92}
+
+.implementation-yes{font-weight:700!important;color:#2f816d!important}
+.implementation-no{font-weight:700!important;color:#b55249!important}
