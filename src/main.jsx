@@ -250,71 +250,86 @@ function normalizeCompareValue(value) {
   return clean(value).replace(/\\s+/g, ' ').trim().toUpperCase();
 }
 
-function isGlsDrawingRow(values, doc) {
-  const text = Object.values(values || {}).join(' ');
-  return /\\bGLS\\b|GLASSLINE/i.test(text) || /-GLS-/i.test(doc);
-}
-
 function parseMidpForComparison(workbook) {
   const records = [];
-  const statusAliases = ['status', 'status code', 'submission status', 'document status', 'status/code'];
-  const codeAliases = ['code', 'status code', 'document code', 'code b/c', 'approval code'];
-  const docAliases = ['document no', 'document number', 'drawing number', 'drawing no', 'document name', 'document id', 'drawing ref', 'drawing reference'];
-  const revAliases = ['revision', 'rev', 'document revision'];
-
-  for (const name of workbook.SheetNames) {
-    const rows = sheetRows(workbook, name);
-    let headerRow = -1, indexes = null;
-    for (let r = 0; r < Math.min(rows.length, 40); r += 1) {
-      const headers = rows[r].map((v) => clean(v).toLowerCase());
-      const doc = headerIndex(headers, docAliases);
-      if (doc >= 0) {
-        headerRow = r;
-        indexes = {
-          doc,
-          status: headerIndex(headers, statusAliases),
-          code: headerIndex(headers, codeAliases),
-          rev: headerIndex(headers, revAliases),
-        };
-        break;
-      }
-    }
-    if (headerRow < 0 || !indexes) continue;
-
-    const rawHeaders = rows[headerRow].map((h, i) => clean(h) || `Column ${i + 1}`);
-    rows.slice(headerRow + 1).forEach((row, offset) => {
-      const doc = clean(row[indexes.doc]);
-      if (!doc || !DOC_PATTERN.test(doc) || !/-DRW-/i.test(doc) || /-(PDF|CAD)$/i.test(doc)) return;
-
-      const values = {};
-      rawHeaders.forEach((header, i) => {
-        values[header] = clean(row[i]);
-      });
-
-      // Only keep drawings belonging to the GLS / Glassline subcontractor.
-      // The filter checks the complete row so it works whether GLS is stored
-      // under Originator, Subcontractor, Contractor, Company, Reference, etc.
-      if (!isGlsDrawingRow(values, doc)) return;
-
-      const titleIndex = headerIndex(rawHeaders, ['title', 'drawing title', 'document title', 'description']);
-      records.push({
-        sourceRow: headerRow + offset + 2,
-        sheet: name,
-        doc,
-        base: baseNumber(doc),
-        title: titleIndex >= 0 ? clean(row[titleIndex]) : '',
-        revision: indexes.rev >= 0 ? revision(row[indexes.rev]) : '',
-        status: indexes.status >= 0 ? clean(row[indexes.status]) : '',
-        code: indexes.code >= 0 ? clean(row[indexes.code]) : '',
-        category: midpCategory(row, indexes.status, indexes.code),
-        values,
-        headers: rawHeaders,
-      });
-    });
+  const targetSheet = workbook.SheetNames.find((name) => clean(name).toUpperCase() === 'MIDP-DRW-SWD');
+  if (!targetSheet) {
+    throw new Error('The MIDP-DRW-SWD sheet was not found. Please upload the correct MIDP workbook.');
   }
 
+  const rows = sheetRows(workbook, targetSheet);
+  let headerRow = -1;
+
+  // This comparison is intentionally limited to the Shop Drawing register.
+  // The project MIDP uses the "Sub-Owner" field in Excel column Z.
+  for (let r = 0; r < Math.min(rows.length, 60); r += 1) {
+    const headers = rows[r].map((v) => clean(v).toLowerCase());
+    const hasDoc = headers.some((h) => h === 'document no' || h === 'document number' || h.includes('document no'));
+    const hasOwner = headers.some((h) => h === 'sub-owner' || h.includes('sub-owner'));
+    if (hasDoc && hasOwner) {
+      headerRow = r;
+      break;
+    }
+  }
+
+  if (headerRow < 0) {
+    throw new Error('The MIDP-DRW-SWD sheet was found, but the header row with Document No and Sub-Owner could not be identified.');
+  }
+
+  const rawHeaders = rows[headerRow].map((h, i) => clean(h) || \`Column \${i + 1}\`);
+  const docIndex = headerIndex(rawHeaders, ['document no', 'document number']);
+  const detectedOwnerIndex = headerIndex(rawHeaders, ['sub-owner']);
+
+  // Column Z is index 25 in a zero-based JavaScript array.
+  const subOwnerIndex = 25;
+  const effectiveOwnerIndex = clean(rows[headerRow][subOwnerIndex])
+    ? subOwnerIndex
+    : detectedOwnerIndex;
+
+  if (docIndex < 0) throw new Error('Document No was not found in MIDP-DRW-SWD.');
+  if (effectiveOwnerIndex < 0) throw new Error('Sub-Owner was not found in MIDP-DRW-SWD column Z.');
+
+  const titleIndex = headerIndex(rawHeaders, ['title', 'drawing title', 'document title', 'description']);
+  const revisionIndex = headerIndex(rawHeaders, ['revision', 'rev']);
+  const statusIndex = headerIndex(rawHeaders, ['status', 'submission status', 'document status']);
+  const codeIndex = headerIndex(rawHeaders, ['code', 'status code', 'document code', 'code b/c', 'approval code']);
+
+  rows.slice(headerRow + 1).forEach((row, offset) => {
+    const doc = clean(row[docIndex]);
+    const subOwner = clean(row[effectiveOwnerIndex]);
+
+    // IMPORTANT: do not search the whole row for "GLS".
+    // Only column Z / Sub-Owner controls the GLS scope.
+    if (!doc || !DOC_PATTERN.test(doc) || !/-DRW-/i.test(doc) || !/^GLS$/i.test(subOwner)) return;
+
+    const values = {};
+    rawHeaders.forEach((header, i) => {
+      values[header] = clean(row[i]);
+    });
+
+    records.push({
+      sourceRow: headerRow + offset + 2,
+      sheet: targetSheet,
+      doc,
+      base: baseNumber(doc),
+      title: titleIndex >= 0 ? clean(row[titleIndex]) : '',
+      revision: revisionIndex >= 0 ? revision(row[revisionIndex]) : '',
+      status: statusIndex >= 0 ? clean(row[statusIndex]) : '',
+      code: codeIndex >= 0 ? clean(row[codeIndex]) : '',
+      category: midpCategory(row, statusIndex, codeIndex),
+      values,
+      headers: rawHeaders,
+    });
+  });
+
+  // The register can contain both CAD and PDF rows for the same drawing.
+  // Compare one logical drawing row, preferring the PDF record when available.
   const map = new Map();
-  records.forEach((record) => map.set(record.base, record));
+  records.forEach((record) => {
+    const existing = map.get(record.base);
+    if (!existing || /-PDF$/i.test(record.doc)) map.set(record.base, record);
+  });
+
   return [...map.values()];
 }
 
@@ -427,11 +442,11 @@ function App() {
     try {
       const [tajBook, glsBook] = await Promise.all([readWorkbook(tajMidpFiles[0]), readWorkbook(glsMidpFiles[0])]);
       const [taj, gls] = [parseMidpForComparison(tajBook), parseMidpForComparison(glsBook)];
-      if (!taj.length || !gls.length) throw new Error('No drawing records were found in one or both MIDP files. Please check that the workbook contains a drawing number column.');
+      if (!taj.length || !gls.length) { const emptySide = !taj.length && !gls.length ? 'both TAJ and GLS' : !taj.length ? 'TAJ' : 'GLS'; throw new Error(`No GLS shop-drawing rows were found in the ${emptySide} MIDP. The tool checks MIDP-DRW-SWD and filters column Z (Sub-Owner) for exactly GLS.`); }
       const rows = compareMidpRecords(taj, gls);
       setMidpComparison({ taj, gls, rows, tajSummary: midpSummary(taj), glsSummary: midpSummary(gls),
         counts: { added: rows.filter((r) => r.type === 'added').length, removed: rows.filter((r) => r.type === 'removed').length, changed: rows.filter((r) => r.type === 'changed').length, unchanged: rows.filter((r) => r.type === 'unchanged').length },
-        filterLabel: 'GLS / Glassline drawings only'
+        filterLabel: 'MIDP-DRW-SWD → Column Z (Sub-Owner) = GLS'
       });
     } catch (e) { setMidpError(e.message || 'The MIDP files could not be compared.'); }
     finally { setMidpLoading(false); }
@@ -510,7 +525,7 @@ function App() {
         <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>BIM document validation</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
         <main>
           {!midpComparison ? <section className="workspace">
-            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS MIDP</h2><p>Compare only the GLS / Glassline subcontractor drawings. Each drawing row is matched by Drawing Number and every available information field is compared.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
+            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS MIDP</h2><p>Compare only GLS shop drawings from MIDP-DRW-SWD. Filter = Column Z "Sub-Owner" exactly equal to GLS. Every populated column in the drawing row is compared.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
             <div className="drop-grid midp-upload-grid">
               <DropZone title="TAJ MIDP" subtitle="TAJ Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={tajMidpFiles} onFiles={(f) => setTajMidpFiles(f.slice(0,1))} color="#c77645" />
               <DropZone title="GLS MIDP" subtitle="Glassline Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
@@ -519,7 +534,7 @@ function App() {
             <button className="primary" disabled={!tajMidpFiles.length || !glsMidpFiles.length || midpLoading} onClick={runMidpComparison}>{midpLoading ? <><LoaderCircle className="spin"/>Comparing MIDPs…</> : <>Compare TAJ vs GLS <ArrowRight size={18}/></>}</button>
             <p className="helper"><Info size={13}/> The comparison is processed locally in your browser.</p>
           </section> : <section className="results midp-results">
-            <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS MIDP</h2><p>Drawing register differences and status/code totals.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
+            <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS MIDP</h2><p>GLS shop-drawing register differences and status/code totals.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
             <div className="gls-filter-note"><strong>Filter:</strong> {midpComparison.filterLabel} <span>•</span> Drawing rows are matched by Drawing Number; every populated column is checked for changes.</div>
             <div className="midp-summary-columns"><MidpSummaryCard title="TAJ MIDP" summary={midpComparison.tajSummary} /><MidpSummaryCard title="GLS MIDP" summary={midpComparison.glsSummary} /></div>
             <div className="midp-change-grid"><div><small>Added in GLS</small><strong>{midpComparison.counts.added}</strong></div><div><small>Removed from GLS</small><strong>{midpComparison.counts.removed}</strong></div><div><small>Changed</small><strong>{midpComparison.counts.changed}</strong></div><div><small>Unchanged</small><strong>{midpComparison.counts.unchanged}</strong></div></div>
