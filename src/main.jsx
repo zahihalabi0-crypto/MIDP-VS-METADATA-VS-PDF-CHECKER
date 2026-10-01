@@ -227,6 +227,88 @@ const FIELD_LABELS = {
   modelRef: 'Model reference', status: 'Status', scale: 'Scale'
 };
 
+
+function normalizeMidpField(value) {
+  return clean(value).toUpperCase().replace(/\s+/g, ' ').trim();
+}
+function midpCategory(row, statusIndex, codeIndex) {
+  const candidates = [
+    statusIndex >= 0 ? normalizeMidpField(row[statusIndex]) : '',
+    codeIndex >= 0 ? normalizeMidpField(row[codeIndex]) : '',
+  ];
+  const combined = candidates.join(' ');
+  if (/\bNYS\b|NOT\s+YET\s+SUBMITTED/i.test(combined)) return 'NYS';
+  if (/\bUR\b|UNDER\s+REVIEW/i.test(combined)) return 'UR';
+  if (/\bCODE\s*D\b|\bD\b/.test(combined)) return 'Code D';
+  if (/\bCODE\s*C\b|\bC\b/.test(combined)) return 'Code C';
+  if (/\bCODE\s*B\b|\bB\b/.test(combined)) return 'Code B';
+  return candidates.find(Boolean) || '';
+}
+function parseMidpForComparison(workbook) {
+  const records = [];
+  const statusAliases = ['status', 'status code', 'submission status', 'document status', 'status/code'];
+  const codeAliases = ['code', 'status code', 'document code', 'code b/c', 'approval code'];
+  const docAliases = ['document no', 'document number', 'drawing number', 'drawing no', 'document name', 'document id'];
+  const revAliases = ['revision', 'rev', 'document revision'];
+  const titleAliases = ['title', 'drawing title', 'document title', 'description'];
+  for (const name of workbook.SheetNames) {
+    const rows = sheetRows(workbook, name);
+    let headerRow = -1, indexes = null;
+    for (let r = 0; r < Math.min(rows.length, 40); r += 1) {
+      const headers = rows[r].map((v) => clean(v).toLowerCase());
+      const doc = headerIndex(headers, docAliases);
+      if (doc >= 0) {
+        headerRow = r;
+        indexes = {
+          doc, status: headerIndex(headers, statusAliases), code: headerIndex(headers, codeAliases),
+          rev: headerIndex(headers, revAliases), title: headerIndex(headers, titleAliases)
+        };
+        break;
+      }
+    }
+    if (headerRow < 0 || !indexes) continue;
+    rows.slice(headerRow + 1).forEach((row, offset) => {
+      const doc = clean(row[indexes.doc]);
+      if (!doc || !DOC_PATTERN.test(doc) || !/-DRW-/i.test(doc) || /-(PDF|CAD)$/i.test(doc)) return;
+      records.push({
+        sourceRow: headerRow + offset + 2, sheet: name, doc, base: baseNumber(doc),
+        title: indexes.title >= 0 ? clean(row[indexes.title]) : '',
+        revision: indexes.rev >= 0 ? revision(row[indexes.rev]) : '',
+        status: indexes.status >= 0 ? clean(row[indexes.status]) : '',
+        code: indexes.code >= 0 ? clean(row[indexes.code]) : '',
+        category: midpCategory(row, indexes.status, indexes.code),
+      });
+    });
+  }
+  const map = new Map();
+  records.forEach((record) => map.set(record.base, record));
+  return [...map.values()];
+}
+function compareMidpRecords(taj, gls) {
+  const tajMap = new Map(taj.map((r) => [r.base, r]));
+  const glsMap = new Map(gls.map((r) => [r.base, r]));
+  const keys = [...new Set([...tajMap.keys(), ...glsMap.keys()])].sort();
+  return keys.map((key) => {
+    const a = tajMap.get(key), b = glsMap.get(key);
+    if (!a) return { key, type: 'added', taj: null, gls: b, changes: ['Added in GLS'] };
+    if (!b) return { key, type: 'removed', taj: a, gls: null, changes: ['Removed from GLS'] };
+    const changes = [];
+    if (normalizeMidpField(a.category) !== normalizeMidpField(b.category)) changes.push('Status / code');
+    if (revision(a.revision) !== revision(b.revision)) changes.push('Revision');
+    if (normalizedTitle(a.title) !== normalizedTitle(b.title)) changes.push('Title');
+    return { key, type: changes.length ? 'changed' : 'unchanged', taj: a, gls: b, changes };
+  });
+}
+function midpSummary(records) {
+  const summary = { total: records.length, UR: 0, 'Code B': 0, 'Code C': 0, 'Code D': 0, NYS: 0, Other: 0 };
+  records.forEach((r) => { if (summary[r.category] != null) summary[r.category] += 1; else summary.Other += 1; });
+  return summary;
+}
+function MidpSummaryCard({ title, summary }) {
+  const items = [['Total Drawings', summary.total], ['UR', summary.UR], ['Code B', summary['Code B']], ['Code C', summary['Code C']], ['Code D', summary['Code D']], ['NYS', summary.NYS]];
+  return <div className="midp-summary-card"><h3>{title}</h3><div className="midp-count-grid">{items.map(([label, value]) => <div key={label}><small>{label}</small><strong>{value}</strong></div>)}</div></div>;
+}
+
 function createChecks(midpRecords, metadataRecords, pdfRecords) {
   // A check session is defined by the drawing PDFs the user selected. The MIDP
   // and metadata may contain thousands of unrelated historical records.
@@ -270,6 +352,12 @@ function StatusBadge({ status, count }) {
 }
 
 function App() {
+  const [mode, setMode] = useState('midp');
+  const [tajMidpFiles, setTajMidpFiles] = useState([]);
+  const [glsMidpFiles, setGlsMidpFiles] = useState([]);
+  const [midpComparison, setMidpComparison] = useState(null);
+  const [midpLoading, setMidpLoading] = useState(false);
+  const [midpError, setMidpError] = useState('');
   const [midpFiles, setMidpFiles] = useState([]);
   const [metadataFiles, setMetadataFiles] = useState([]);
   const [pdfFiles, setPdfFiles] = useState([]);
@@ -284,6 +372,33 @@ function App() {
     warning: checks.reduce((n, c) => n + c.rows.filter((r) => ['warning', 'missing'].includes(r.status)).length, 0),
     fail: checks.reduce((n, c) => n + c.rows.filter((r) => r.status === 'fail').length, 0),
   }), [checks]);
+
+  async function runMidpComparison() {
+    setMidpLoading(true); setMidpError(''); setMidpComparison(null);
+    try {
+      const [tajBook, glsBook] = await Promise.all([readWorkbook(tajMidpFiles[0]), readWorkbook(glsMidpFiles[0])]);
+      const [taj, gls] = [parseMidpForComparison(tajBook), parseMidpForComparison(glsBook)];
+      if (!taj.length || !gls.length) throw new Error('No drawing records were found in one or both MIDP files. Please check that the workbook contains a drawing number column.');
+      const rows = compareMidpRecords(taj, gls);
+      setMidpComparison({ taj, gls, rows, tajSummary: midpSummary(taj), glsSummary: midpSummary(gls),
+        counts: { added: rows.filter((r) => r.type === 'added').length, removed: rows.filter((r) => r.type === 'removed').length, changed: rows.filter((r) => r.type === 'changed').length, unchanged: rows.filter((r) => r.type === 'unchanged').length }
+      });
+    } catch (e) { setMidpError(e.message || 'The MIDP files could not be compared.'); }
+    finally { setMidpLoading(false); }
+  }
+  function downloadMidpReport() {
+    if (!midpComparison) return;
+    const data = midpComparison.rows.map((r) => ({
+      'Drawing Number': r.key, 'Comparison Result': r.type,
+      'TAJ Status/Code': r.taj?.category || '', 'GLS Status/Code': r.gls?.category || '',
+      'TAJ Revision': r.taj?.revision || '', 'GLS Revision': r.gls?.revision || '',
+      'TAJ Title': r.taj?.title || '', 'GLS Title': r.gls?.title || '', Changes: r.changes.join(', ')
+    }));
+    const ws = XLSX.utils.json_to_sheet(data);
+    ws['!cols'] = [{wch:50},{wch:20},{wch:18},{wch:18},{wch:14},{wch:14},{wch:55},{wch:55},{wch:30}];
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'TAJ vs GLS');
+    XLSX.writeFile(wb, 'TAJ_vs_GLS_MIDP_' + new Date().toISOString().slice(0,10) + '.xlsx');
+  }
 
   async function runCheck() {
     setLoading(true); setError('');
@@ -313,22 +428,50 @@ function App() {
     XLSX.writeFile(wb, `DrawingCheck_Report_${new Date().toISOString().slice(0, 10)}.xlsx`);
   }
 
+  if (mode === 'midp') {
+    return (
+      <div className="app">
+        <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>BIM document validation</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
+        <main>
+          {!midpComparison ? <section className="workspace">
+            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS MIDP</h2><p>Compare the two MIDP files before checking MIDP, metadata and PDF consistency.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
+            <div className="drop-grid midp-upload-grid">
+              <DropZone title="TAJ MIDP" subtitle="TAJ Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={tajMidpFiles} onFiles={(f) => setTajMidpFiles(f.slice(0,1))} color="#c77645" />
+              <DropZone title="GLS MIDP" subtitle="Glassline Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
+            </div>
+            {midpError && <div className="error"><XCircle size={18}/>{midpError}</div>}
+            <button className="primary" disabled={!tajMidpFiles.length || !glsMidpFiles.length || midpLoading} onClick={runMidpComparison}>{midpLoading ? <><LoaderCircle className="spin"/>Comparing MIDPs…</> : <>Compare TAJ vs GLS <ArrowRight size={18}/></>}</button>
+            <p className="helper"><Info size={13}/> The comparison is processed locally in your browser.</p>
+          </section> : <section className="results midp-results">
+            <div className="results-top"><div><span className="eyebrow">MIDP COMPARISON COMPLETE</span><h2>TAJ MIDP vs GLS MIDP</h2><p>Drawing register differences and status/code totals.</p></div><div className="actions"><button className="secondary" onClick={() => setMidpComparison(null)}><RotateCcw size={16}/>Change files</button><button className="primary compact" onClick={downloadMidpReport}><Download size={17}/>Export comparison</button></div></div>
+            <div className="midp-summary-columns"><MidpSummaryCard title="TAJ MIDP" summary={midpComparison.tajSummary} /><MidpSummaryCard title="GLS MIDP" summary={midpComparison.glsSummary} /></div>
+            <div className="midp-change-grid"><div><small>Added in GLS</small><strong>{midpComparison.counts.added}</strong></div><div><small>Removed from GLS</small><strong>{midpComparison.counts.removed}</strong></div><div><small>Changed</small><strong>{midpComparison.counts.changed}</strong></div><div><small>Unchanged</small><strong>{midpComparison.counts.unchanged}</strong></div></div>
+            <div className="comparison-head midp-table-head"><span>Drawing Number</span><span>TAJ</span><span>GLS</span><span>Changes</span><span>Result</span></div>
+            <div className="checks">{midpComparison.rows.map((r) => <article className="check" key={r.key}><div className="midp-result-row"><strong>{r.key}</strong><span>{r.taj?.category || '—'}</span><span>{r.gls?.category || '—'}</span><span>{r.changes.join(', ') || 'No changes'}</span><StatusBadge status={r.type === 'unchanged' ? 'pass' : r.type === 'changed' ? 'warning' : 'fail'} count={r.type} /></div></article>)}</div>
+            <div className="next-check"><div><span className="eyebrow">NEXT STEP</span><h3>MIDP vs Metadata vs PDF</h3><p>Continue with the existing drawing validation workflow using the GLS MIDP.</p></div><button className="primary" onClick={() => { setMidpFiles(glsMidpFiles); setMode('validator'); }}><ArrowRight size={18}/>Continue to drawing checker</button></div>
+          </section>}
+        </main>
+        <footer><span>DrawingCheck <b>0.2</b></span><span>Designed for controlled BIM / Document Control review</span></footer>
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>BIM document validation</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
       <main>
         {!checks.length ? <section className="workspace">
-          <div className="section-title"><div><span>01</span><div><h2>Add submission files</h2><p>One MIDP, one metadata export, and the issued drawing PDFs.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
+          <div className="section-title"><div><span>02</span><div><h2>MIDP vs Metadata vs PDF</h2><p>Validate the GLS MIDP against metadata and issued drawing PDFs.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
           <div className="drop-grid">
             <DropZone title="MIDP workbook" subtitle="Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={midpFiles} onFiles={(f) => setMidpFiles(f.slice(0,1))} color="#c77645" />
             <DropZone title="Metadata export" subtitle="Document Control data" icon={FileSpreadsheet} accept=".xlsx,.xls" files={metadataFiles} onFiles={(f) => setMetadataFiles(f.slice(0,1))} color="#507e79" />
             <DropZone title="Drawing PDFs" subtitle="Issued title blocks" icon={FileText} accept=".pdf" multiple files={pdfFiles} onFiles={setPdfFiles} color="#8b7961" />
           </div>
           {error && <div className="error"><XCircle size={18}/>{error}</div>}
-          <button className="primary" disabled={!ready || loading} onClick={runCheck}>{loading ? <><LoaderCircle className="spin"/>Reading and comparing files…</> : <>Run validation <ArrowRight size={18}/></>}</button>
+          <button className="secondary back-to-midp" onClick={() => setMode('midp')}><RotateCcw size={16}/>TAJ vs GLS MIDP</button><button className="primary" disabled={!ready || loading} onClick={runCheck}>{loading ? <><LoaderCircle className="spin"/>Reading and comparing files…</> : <>Run validation <ArrowRight size={18}/></>}</button>
           <p className="helper"><Info size={13}/> Digitally generated PDFs are supported. Scanned title blocks will require the OCR add-on.</p>
         </section> : <section className="results">
-          <div className="results-top"><div><span className="eyebrow">VALIDATION COMPLETE</span><h2>Submission review</h2><p>{totals.drawings} drawing{totals.drawings !== 1 ? 's' : ''} checked across three sources.</p></div><div className="actions"><button className="secondary" onClick={reset}><RotateCcw size={16}/>New check</button><button className="primary compact" onClick={downloadReport}><Download size={17}/>Export report</button></div></div>
+          <div className="results-top"><div><span className="eyebrow">VALIDATION COMPLETE</span><h2>Submission review</h2><p>{totals.drawings} drawing{totals.drawings !== 1 ? 's' : ''} checked across three sources.</p></div><div className="actions"><button className="secondary" onClick={() => setMode('midp')}><RotateCcw size={16}/>TAJ vs GLS</button><button className="secondary" onClick={reset}><RotateCcw size={16}/>New check</button><button className="primary compact" onClick={downloadReport}><Download size={17}/>Export report</button></div></div>
           <div className="summary-grid"><div><small>Drawings</small><strong>{totals.drawings}</strong></div><div className="green"><small>Matching fields</small><strong>{totals.pass}</strong></div><div className="amber"><small>Warnings</small><strong>{totals.warning}</strong></div><div className="red"><small>Mismatches</small><strong>{totals.fail}</strong></div></div>
           <div className="comparison-head"><span>Drawing / field</span><span>MIDP</span><span>Metadata</span><span>PDF title block</span><span>Result</span></div>
           <div className="checks">{checks.map((c) => <article className="check" key={c.key}>
@@ -337,7 +480,7 @@ function App() {
           </article>)}</div>
         </section>}
       </main>
-      <footer><span>DrawingCheck <b>0.1</b></span><span>Designed for controlled BIM / Document Control review</span></footer>
+      <footer><span>DrawingCheck <b>0.2</b></span><span>Designed for controlled BIM / Document Control review</span></footer>
     </div>
   );
 }
