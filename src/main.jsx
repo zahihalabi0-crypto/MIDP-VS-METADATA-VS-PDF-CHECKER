@@ -250,95 +250,69 @@ function normalizeCompareValue(value) {
   return clean(value).replace(/\\s+/g, ' ').trim().toUpperCase();
 }
 
-function parseMidpForComparison(workbook) {
-  const records = [];
-  const targetSheet = workbook.SheetNames.find((name) => clean(name).toUpperCase() === 'MIDP-DRW-SWD');
+function findDrawingSheet(workbook) {
+  const exact = workbook.SheetNames.find((name) => /^MIDP-DRW-SWD$/i.test(clean(name)));
+  if (exact) return exact;
+  return workbook.SheetNames.find((name) => /^(MIDP|TIDP).*(DRW|SWD)|^(MIDP|TIDP)$/i.test(clean(name)));
+}
+
+function parseDrawingRegister(workbook, { filterGLS = false } = {}) {
+  const targetSheet = findDrawingSheet(workbook);
   if (!targetSheet) {
-    throw new Error(`MIDP-DRW-SWD was not found. Available sheets: ${workbook.SheetNames.join(', ')}`);
+    throw new Error(`No MIDP/TIDP drawing register sheet was found. Available sheets: ${workbook.SheetNames.join(', ')}`);
   }
 
   const rows = sheetRows(workbook, targetSheet);
   const normalizeHeader = (v) => clean(v).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-  const isOwnerHeader = (v) => /^(sub owner|sub-owner)$/.test(normalizeHeader(v)) || normalizeHeader(v).includes('sub owner');
+  const isOwnerHeader = (v) => normalizeHeader(v).includes('sub owner');
   const isDrawingHeader = (v) => {
     const h = normalizeHeader(v);
-    return [
-      'document no', 'document number', 'drawing no', 'drawing number',
-      'doc no', 'doc number', 'drawing id', 'document id'
-    ].includes(h) || ((h.includes('drawing') || h.includes('document')) && (h.includes('no') || h.includes('number')));
+    return h === 'drawing number' || h === 'drawing no' || h === 'document number' ||
+      h === 'document no' || h.includes('drawing number') || h.includes('document number');
   };
 
-  // Column Z is authoritative for Sub-Owner.
-  const ownerIndex = 25;
+  const ownerIndex = 25; // Column Z
   let headerRow = -1;
 
-  // First preference: the row containing "Sub-Owner" in column Z.
-  for (let r = 0; r < Math.min(rows.length, 80); r += 1) {
-    if (isOwnerHeader(rows[r]?.[ownerIndex])) {
-      headerRow = r;
-      break;
+  // For the TAJ MIDP, Column Z is authoritative. For TIDP, we only need
+  // the drawing register itself because all rows belong to GLS.
+  if (filterGLS) {
+    for (let r = 0; r < Math.min(rows.length, 80); r += 1) {
+      if (isOwnerHeader(rows[r]?.[ownerIndex])) { headerRow = r; break; }
     }
   }
-
-  // Fallback: find a row containing Sub-Owner anywhere.
   if (headerRow < 0) {
     for (let r = 0; r < Math.min(rows.length, 80); r += 1) {
-      if (rows[r].some(isOwnerHeader)) {
-        headerRow = r;
-        break;
-      }
+      if (rows[r].some(isDrawingHeader)) { headerRow = r; break; }
     }
   }
-
   if (headerRow < 0) {
-    throw new Error(`MIDP-DRW-SWD was found, but a Sub-Owner header could not be identified. Column Z sample: ${rows.slice(0,10).map((r,i)=>`row ${i+1}: ${clean(r?.[ownerIndex])}`).join(' | ')}`);
+    throw new Error(`${targetSheet} was found, but the drawing register header row could not be identified.`);
   }
 
   const rawHeaders = rows[headerRow].map((h, i) => clean(h) || `Column ${i + 1}`);
   let docIndex = rawHeaders.findIndex(isDrawingHeader);
 
-  // Fallback: detect the column containing the most real drawing numbers.
   if (docIndex < 0) {
-    let bestIndex = -1;
-    let bestScore = 0;
-    const maxCol = Math.max(...rows.slice(headerRow + 1, headerRow + 61).map(r => r.length), rawHeaders.length);
-    for (let c = 0; c < maxCol; c += 1) {
-      let score = 0;
-      for (const row of rows.slice(headerRow + 1, headerRow + 61)) {
-        const value = clean(row[c]);
-        if (DOC_PATTERN.test(value) && /-DRW-/i.test(value)) score += 1;
-      }
-      if (score > bestScore) { bestScore = score; bestIndex = c; }
-    }
-    if (bestIndex >= 0) docIndex = bestIndex;
+    throw new Error(`${targetSheet}: DRAWING NUMBER column could not be identified. Headers: ${rawHeaders.filter(Boolean).join(' | ')}`);
   }
 
-  if (docIndex < 0) {
-    throw new Error(`MIDP-DRW-SWD was found and Sub-Owner was detected on row ${headerRow + 1}, but no drawing/document-number column could be identified. Headers: ${rawHeaders.filter(Boolean).join(' | ')}`);
-  }
-
-  const titleIndex = headerIndex(rawHeaders, ['title', 'drawing title', 'document title', 'description']);
-  const revisionIndex = headerIndex(rawHeaders, ['revision', 'rev']);
   const statusIndex = headerIndex(rawHeaders, ['status', 'submission status', 'document status']);
   const codeIndex = headerIndex(rawHeaders, ['code', 'status code', 'document code', 'code b/c', 'approval code']);
+  const titleIndex = headerIndex(rawHeaders, ['title', 'drawing title', 'document title', 'description']);
+  const revisionIndex = headerIndex(rawHeaders, ['revision', 'rev']);
 
-  let glsRows = 0;
-  let drawingRows = 0;
+  const records = [];
+  let scopedRows = 0;
 
   rows.slice(headerRow + 1).forEach((row, offset) => {
     const doc = clean(row[docIndex]);
     const subOwner = clean(row[ownerIndex]);
 
-    if (/^GLS$/i.test(subOwner)) glsRows += 1;
-    if (doc && /-DRW-/i.test(doc)) drawingRows += 1;
-
-    // IMPORTANT: Column Z / Sub-Owner is the only scope filter.
-    if (!doc || !/^GLS$/i.test(subOwner)) return;
-
-    // DRAWING NUMBER is the authoritative identifier. Do not require a
-    // particular naming pattern such as -DRW- because the real MIDP may use
-    // different project-specific drawing number formats.
+    if (filterGLS && !/^GLS$/i.test(subOwner)) return;
     if (!doc) return;
+
+    scopedRows += 1;
 
     const values = {};
     rawHeaders.forEach((header, i) => {
@@ -362,10 +336,12 @@ function parseMidpForComparison(workbook) {
   });
 
   if (!records.length) {
-    throw new Error(`MIDP-DRW-SWD was read successfully, but no GLS drawing records were found. Header row: ${headerRow + 1}; drawing/document column: ${rawHeaders[docIndex] || `Column ${docIndex + 1}`}; GLS rows in Column Z: ${glsRows}; rows containing -DRW-: ${drawingRows}. The tool filters ONLY Column Z (Sub-Owner) = GLS.`);
+    throw new Error(filterGLS
+      ? `${targetSheet} was read successfully, but no GLS rows were found. Column Z (Sub-Owner) must equal GLS. Rows with GLS in Column Z: 0.`
+      : `${targetSheet} was read successfully, but no drawing rows were found.`);
   }
 
-  // If both CAD and PDF rows exist for one drawing, keep the PDF row.
+  // If duplicate PDF/CAD records exist for the same drawing, prefer PDF.
   const map = new Map();
   records.forEach((record) => {
     const existing = map.get(record.base);
@@ -373,6 +349,17 @@ function parseMidpForComparison(workbook) {
   });
 
   return [...map.values()];
+}
+
+function parseTajMidp(workbook) {
+  // TAJ MIDP contains multiple disciplines/sub-owners.
+  // Only Column Z = GLS belongs in this comparison.
+  return parseDrawingRegister(workbook, { filterGLS: true });
+}
+
+function parseGlsTidp(workbook) {
+  // GLS TIDP contains only GLS drawings, so every drawing row is included.
+  return parseDrawingRegister(workbook, { filterGLS: false });
 }
 function compareMidpRecords(taj, gls) {
   const tajMap = new Map(taj.map((r) => [r.base, r]));
@@ -482,12 +469,12 @@ function App() {
     setMidpLoading(true); setMidpError(''); setMidpComparison(null);
     try {
       const [tajBook, glsBook] = await Promise.all([readWorkbook(tajMidpFiles[0]), readWorkbook(glsMidpFiles[0])]);
-      const [taj, gls] = [parseMidpForComparison(tajBook), parseMidpForComparison(glsBook)];
+      const [taj, gls] = [parseTajMidp(tajBook), parseGlsTidp(glsBook)];
       if (!taj.length || !gls.length) { const emptySide = !taj.length && !gls.length ? 'both TAJ and GLS' : !taj.length ? 'TAJ' : 'GLS'; throw new Error(`No GLS shop-drawing rows were found in the ${emptySide} MIDP. The tool checks MIDP-DRW-SWD and filters column Z (Sub-Owner) for exactly GLS.`); }
       const rows = compareMidpRecords(taj, gls);
       setMidpComparison({ taj, gls, rows, tajSummary: midpSummary(taj), glsSummary: midpSummary(gls),
         counts: { added: rows.filter((r) => r.type === 'added').length, removed: rows.filter((r) => r.type === 'removed').length, changed: rows.filter((r) => r.type === 'changed').length, unchanged: rows.filter((r) => r.type === 'unchanged').length },
-        filterLabel: 'MIDP-DRW-SWD → Column Z (Sub-Owner) = GLS'
+        filterLabel: 'TAJ MIDP: MIDP-DRW-SWD → Column Z (Sub-Owner) = GLS; GLS TIDP: all drawing rows'
       });
     } catch (e) { setMidpError(e.message || 'The MIDP files could not be compared.'); }
     finally { setMidpLoading(false); }
@@ -529,7 +516,7 @@ function App() {
     ws['!cols'] = [{wch:50},{wch:18},{wch:35},{wch:65},{wch:65},{wch:45}];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'TAJ vs GLS');
-    XLSX.writeFile(wb, 'TAJ_vs_GLS_MIDP_' + new Date().toISOString().slice(0,10) + '.xlsx');
+    XLSX.writeFile(wb, 'TAJ_vs_GLS_TIDP_' + new Date().toISOString().slice(0,10) + '.xlsx');
   }
 
   async function runCheck() {
@@ -566,10 +553,10 @@ function App() {
         <header><div className="brand"><span className="brand-mark"><ShieldCheck /></span><div><strong>DrawingCheck</strong><small>BIM document validation</small></div></div><span className="privacy"><Lock size={13} /> Files stay in your browser</span></header>
         <main>
           {!midpComparison ? <section className="workspace">
-            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS MIDP</h2><p>Compare only GLS shop drawings from MIDP-DRW-SWD. Filter = Column Z "Sub-Owner" exactly equal to GLS. Every populated column in the drawing row is compared.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
+            <div className="section-title"><div><span>01</span><div><h2>TAJ MIDP vs GLS TIDP</h2><p>Compare only GLS shop drawings from MIDP-DRW-SWD. Filter = Column Z "Sub-Owner" exactly equal to GLS. Every populated column in the drawing row is compared.</p></div></div><span className="secure"><Lock size={14}/> Local processing</span></div>
             <div className="drop-grid midp-upload-grid">
               <DropZone title="TAJ MIDP" subtitle="TAJ Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={tajMidpFiles} onFiles={(f) => setTajMidpFiles(f.slice(0,1))} color="#c77645" />
-              <DropZone title="GLS MIDP" subtitle="Glassline Master Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
+              <DropZone title="GLS TIDP" subtitle="Glassline Task Information Delivery Plan" icon={FileSpreadsheet} accept=".xlsx,.xls" files={glsMidpFiles} onFiles={(f) => setGlsMidpFiles(f.slice(0,1))} color="#507e79" />
             </div>
             {midpError && <div className="error"><XCircle size={18}/>{midpError}</div>}
             <button className="primary" disabled={!tajMidpFiles.length || !glsMidpFiles.length || midpLoading} onClick={runMidpComparison}>{midpLoading ? <><LoaderCircle className="spin"/>Comparing MIDPs…</> : <>Compare TAJ vs GLS <ArrowRight size={18}/></>}</button>
@@ -608,7 +595,7 @@ function App() {
             <DropZone title="Drawing PDFs" subtitle="Issued title blocks" icon={FileText} accept=".pdf" multiple files={pdfFiles} onFiles={setPdfFiles} color="#8b7961" />
           </div>
           {error && <div className="error"><XCircle size={18}/>{error}</div>}
-          <button className="secondary back-to-midp" onClick={() => setMode('midp')}><RotateCcw size={16}/>TAJ vs GLS MIDP</button><button className="primary" disabled={!ready || loading} onClick={runCheck}>{loading ? <><LoaderCircle className="spin"/>Reading and comparing files…</> : <>Run validation <ArrowRight size={18}/></>}</button>
+          <button className="secondary back-to-midp" onClick={() => setMode('midp')}><RotateCcw size={16}/>TAJ vs GLS TIDP</button><button className="primary" disabled={!ready || loading} onClick={runCheck}>{loading ? <><LoaderCircle className="spin"/>Reading and comparing files…</> : <>Run validation <ArrowRight size={18}/></>}</button>
           <p className="helper"><Info size={13}/> Digitally generated PDFs are supported. Scanned title blocks will require the OCR add-on.</p>
         </section> : <section className="results">
           <div className="results-top"><div><span className="eyebrow">VALIDATION COMPLETE</span><h2>Submission review</h2><p>{totals.drawings} drawing{totals.drawings !== 1 ? 's' : ''} checked across three sources.</p></div><div className="actions"><button className="secondary" onClick={() => setMode('midp')}><RotateCcw size={16}/>TAJ vs GLS</button><button className="secondary" onClick={reset}><RotateCcw size={16}/>New check</button><button className="primary compact" onClick={downloadReport}><Download size={17}/>Export report</button></div></div>
